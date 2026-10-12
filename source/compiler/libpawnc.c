@@ -192,6 +192,15 @@ static unsigned srccache_hash(const char *s)
   return h&(SRCCACHE_BUCKETS-1);
 }
 
+#ifdef PERF_TRACE
+static unsigned long sc_hits=0,sc_loads=0,sc_statfail=0;
+static double sc_bytes=0,sc_t_stat=0,sc_t_open=0,sc_t_read=0,sc_t_xlat=0;
+static void srccache_report(void)
+{
+  fprintf(stderr,"[perf] srccache: hits=%lu loads=%lu stat_fail=%lu bytes=%.1f MB | stat %.3f s, fopen %.3f s, read+close %.3f s, text xlat %.3f s\n",
+          sc_hits,sc_loads,sc_statfail,sc_bytes/1048576.0,sc_t_stat,sc_t_open,sc_t_read,sc_t_xlat);
+}
+#endif
 static SRCCACHE *srccache_load(const char *filename)
 {
   unsigned h=srccache_hash(filename);
@@ -202,22 +211,49 @@ static SRCCACHE *srccache_load(const char *filename)
   char *raw;
   size_t n,i,o;
 
+#ifdef PERF_TRACE
+  static int reg=0;
+  double t0,t1;
+  if (!reg) { reg=1; atexit(srccache_report); }
+#endif
   for (e=srccache[h]; e!=NULL; e=e->next)
-    if (strcmp(e->name,filename)==0)
+    if (strcmp(e->name,filename)==0) {
+#ifdef PERF_TRACE
+      sc_hits++;
+#endif
       return e;
-  if (stat(filename,&st)!=0 || (st.st_mode & S_IFDIR)!=0)
+    } /* if */
+#ifdef PERF_TRACE
+  t0=perf_now();
+#endif
+  if (stat(filename,&st)!=0 || (st.st_mode & S_IFDIR)!=0) {
+#ifdef PERF_TRACE
+    sc_statfail++;
+    sc_t_stat+=perf_now()-t0;
+#endif
     return NULL;                /* no such file; a directory with the same name is not a source file */
+  } /* if */
+#ifdef PERF_TRACE
+  t1=perf_now(); sc_t_stat+=t1-t0; t0=t1;
+#endif
   if ((fp=fopen(filename,"rb"))==NULL)
     return NULL;
   fseek(fp,0L,SEEK_END);
   len=ftell(fp);
   fseek(fp,0L,SEEK_SET);
+#ifdef PERF_TRACE
+  t1=perf_now(); sc_t_open+=t1-t0; t0=t1;
+#endif
   if (len<0 || (raw=(char *)malloc((size_t)len+1))==NULL) {
     fclose(fp);
     return NULL;
   } /* if */
   n=fread(raw,1,(size_t)len,fp);
   fclose(fp);
+#ifdef PERF_TRACE
+  t1=perf_now(); sc_t_read+=t1-t0; t0=t1;
+  sc_loads++; sc_bytes+=(double)n;
+#endif
   /* text-mode translation, in place */
   for (i=o=0; i<n; i++) {
     if (raw[i]=='\x1a')
@@ -227,6 +263,9 @@ static SRCCACHE *srccache_load(const char *filename)
     raw[o++]=raw[i];
   } /* for */
   raw[o]='\0';
+#ifdef PERF_TRACE
+  sc_t_xlat+=perf_now()-t0;
+#endif
   if ((e=(SRCCACHE *)malloc(sizeof(SRCCACHE)+strlen(filename)))==NULL) {
     free(raw);
     return NULL;

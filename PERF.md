@@ -78,6 +78,26 @@ Threads would not pay off: the passes are strictly sequential, and the preproces
 parser because `#if defined` sees symbols the parser has declared (YSI relies on it). Only the assembler (14%)
 could overlap with the second pass. The preprocessor (~1/3 of the total) is the next target.
 
+## Sampling profile after round 5 (quiet machine, 6986 samples)
+
+Self time plus the CRT/ntdll samples attributed to their pawnc caller, grouped:
+
+| Group | Share | Main entries |
+|---|---:|---|
+| preprocessor and source files | ~24% | `substpattern` 5.8, `srccache_load` (failing `stat`) 5.5, `find_stringpair` 3.9, `substallpatterns` 2.0, `stripcomment` 1.8, `skim` 1.7 |
+| assembler | ~18% | `assemble` 5.9 (3.1 of it CRT calls), `mfgets` 2.7, `pc_writebin` 2.8, `write_encoded` 2.2, `hex2long` 1.2, `findopcode` 1.1 |
+| parser and symbols | ~16% | `plnge` 2.6, `find_symbol` 2.7, `nextop` 1.6, `hier*` ~4 |
+| lexer | ~15% | `lex` 6.4, `matchtoken` 3.0, `number`/`ftoi` 4.2 |
+| code generator text | ~12% | `stgwrite` 6.3, `stgget` 1.3, `itoh` 1.3 |
+
+`-D PERF_TRACE` also counts the source loader: 1691 files (38.8 MB) read in ~0.2 s, but 14,342 `stat` calls on
+missing paths take 0.7 s (the missing-path cache is per exact string; every include dir x extension x name
+misses once). Under an antivirus scan `srccache_load` waits much longer (18% of a loaded run's samples).
+
+Cheap next steps, single-threaded: answer missing paths from a per-directory listing instead of `stat`;
+in `lex`, test for a digit once before `number()`/`ftoi()` (every identifier goes through both, and `ftoi`
+builds `dbase` before its own `isdigit` test); CRT `isdigit`/`tolower` in the hot loops.
+
 ## Remaining profile (not done)
 
 `stgwrite`/`assemble` text handling (the code generator writes text, the assembler parses it back three times),

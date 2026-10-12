@@ -5019,45 +5019,155 @@ static void make_report(symbol *root,FILE *log,char *sourcefile)
  * "citron", but neither function "banana" nor "citron" are used by anyone
  * else, then, by inference, function "apple" is not used either.
  */
+/* A function that nobody refers to (and that is not public, native, main or the entry function) is dead:
+ * its usage bits are erased and it is removed from the referrer lists of everything it uses, which may make
+ * those dead in turn. The original implementation rescanned the whole symbol table, and every referrer list
+ * in it, for each dead function and then restarted until nothing changed (cubic in the worst case, a fifth of
+ * the compile time of a large gamemode). The result is the same fixed point; it is computed here with a work
+ * list: every symbol is visited once, every referrer-list entry is visited once.
+ */
+static int refs_dead_candidate(const symbol *sym)
+{
+  return sym->ident==iFUNCTN
+         && (sym->usage & uNATIVE)==0
+         && (sym->usage & uPUBLIC)==0
+         && strcmp(sym->name,uMAINFUNC)!=0
+         && strcmp(sym->name,uENTRYFUNC)!=0
+         && (sym->usage & uGLOBALREF)==0;
+}
+
+static size_t refs_slot(const symbol *p,size_t mask)
+{
+  size_t h=((size_t)p>>4)*2654435761u;
+  h^=h>>15;
+  return h&mask;
+}
+
 static void reduce_referrers(symbol *root)
 {
-  int i,restart;
-  symbol *sym,*ref;
+  symbol *sym,*ref,**syms,**tabkey;
+  int n,i,j,k,p,qhead,qtail;
+  int *live,*first,*fill,*edge_sym,*edge_pos,*queue,*tabval;
+  char *queued;
+  size_t tabsize,mask,s;
 
-  do {
-    restart=0;
-    for (sym=root->next; sym!=NULL; sym=sym->next) {
-      if (sym->parent!=NULL)
-        continue;                 /* hierarchical data type */
-      if (sym->ident==iFUNCTN
-          && (sym->usage & uNATIVE)==0
-          && (sym->usage & uPUBLIC)==0 && strcmp(sym->name,uMAINFUNC)!=0 && strcmp(sym->name,uENTRYFUNC)!=0
-          && !has_referrers(sym))
-      {
-        sym->usage&=~(uREAD | uWRITTEN);  /* erase usage bits if there is no referrer */
-        /* find all symbols that are referred by this symbol */
-        for (ref=root->next; ref!=NULL; ref=ref->next) {
-          if (ref->parent!=NULL)
-            continue;             /* hierarchical data type */
-          assert(ref->refer!=NULL);
-          for (i=0; i<ref->numrefers && ref->refer[i]!=sym; i++)
-            /* nothing */;
-          if (i<ref->numrefers) {
-            assert(ref->refer[i]==sym);
-            ref->refer[i]=NULL;
-            restart++;
-          } /* if */
-        } /* for */
-      } else if ((sym->ident==iVARIABLE || sym->ident==iARRAY)
-                 && (sym->usage & uPUBLIC)==0
-                 && sym->parent==NULL
-                 && !has_referrers(sym))
-      {
-        sym->usage&=~(uREAD | uWRITTEN);  /* erase usage bits if there is no referrer */
+  for (n=0,sym=root->next; sym!=NULL; sym=sym->next)
+    if (sym->parent==NULL)       /* hierarchical data types do not take part */
+      n++;
+  if (n==0)
+    return;
+
+  tabsize=16;
+  while (tabsize<(size_t)n*2)
+    tabsize<<=1;
+  mask=tabsize-1;
+  syms=(symbol **)malloc(n*sizeof(symbol *));
+  tabkey=(symbol **)calloc(tabsize,sizeof(symbol *));
+  tabval=(int *)malloc(tabsize*sizeof(int));
+  live=(int *)calloc(n,sizeof(int));
+  first=(int *)calloc(n+1,sizeof(int));
+  fill=(int *)malloc((n+1)*sizeof(int));
+  queue=(int *)malloc(n*sizeof(int));
+  queued=(char *)calloc(n,sizeof(char));
+  if (syms==NULL || tabkey==NULL || tabval==NULL || live==NULL || first==NULL || fill==NULL
+      || queue==NULL || queued==NULL)
+    error(103);                  /* insufficient memory (fatal error) */
+
+  /* index the symbols by address; a referrer entry that is not in the table is never touched */
+  for (i=0,sym=root->next; sym!=NULL; sym=sym->next) {
+    if (sym->parent!=NULL)
+      continue;
+    syms[i]=sym;
+    for (s=refs_slot(sym,mask); tabkey[s]!=NULL; s=(s+1)&mask)
+      /* nothing */;
+    tabkey[s]=sym;
+    tabval[s]=i;
+    i++;
+  } /* for */
+
+  /* pass 1: live referrers per symbol, and how many entries point at each function */
+  for (i=0; i<n; i++) {
+    ref=syms[i];
+    for (j=0; j<ref->numrefers; j++) {
+      symbol *user=ref->refer[j];
+      if (user==NULL)
+        continue;
+      live[i]++;
+      for (s=refs_slot(user,mask); tabkey[s]!=NULL && tabkey[s]!=user; s=(s+1)&mask)
+        /* nothing */;
+      if (tabkey[s]!=NULL)
+        first[tabval[s]+1]++;
+    } /* for */
+  } /* for */
+  for (i=0; i<n; i++)
+    first[i+1]+=first[i];
+  memcpy(fill,first,(n+1)*sizeof(int));
+  edge_sym=(int *)malloc((first[n]>0 ? first[n] : 1)*sizeof(int));
+  edge_pos=(int *)malloc((first[n]>0 ? first[n] : 1)*sizeof(int));
+  if (edge_sym==NULL || edge_pos==NULL)
+    error(103);
+
+  /* pass 2: for every function, the places in other symbols' referrer lists where it is listed */
+  for (i=0; i<n; i++) {
+    ref=syms[i];
+    for (j=0; j<ref->numrefers; j++) {
+      symbol *user=ref->refer[j];
+      if (user==NULL)
+        continue;
+      for (s=refs_slot(user,mask); tabkey[s]!=NULL && tabkey[s]!=user; s=(s+1)&mask)
+        /* nothing */;
+      if (tabkey[s]!=NULL) {
+        k=tabval[s];
+        p=fill[k]++;
+        edge_sym[p]=i;
+        edge_pos[p]=j;
       } /* if */
     } /* for */
-    /* after removing a symbol, check whether more can be removed */
-  } while (restart>0);
+  } /* for */
+
+  qhead=qtail=0;
+  for (i=0; i<n; i++) {
+    if (live[i]==0 && refs_dead_candidate(syms[i])) {
+      queued[i]=1;
+      queue[qtail++]=i;
+    } /* if */
+  } /* for */
+  while (qhead<qtail) {
+    i=queue[qhead++];
+    sym=syms[i];
+    sym->usage&=~(uREAD | uWRITTEN);        /* erase usage bits if there is no referrer */
+    for (p=first[i]; p<first[i+1]; p++) {
+      k=edge_sym[p];
+      ref=syms[k];
+      if (ref->refer[edge_pos[p]]==sym) {
+        ref->refer[edge_pos[p]]=NULL;
+        live[k]--;
+        if (live[k]==0 && !queued[k] && refs_dead_candidate(ref)) {
+          queued[k]=1;
+          queue[qtail++]=k;
+        } /* if */
+      } /* if */
+    } /* for */
+  } /* while */
+
+  for (i=0; i<n; i++) {
+    sym=syms[i];
+    if ((sym->ident==iVARIABLE || sym->ident==iARRAY)
+        && (sym->usage & uPUBLIC)==0
+        && live[i]==0 && (sym->usage & uGLOBALREF)==0)
+      sym->usage&=~(uREAD | uWRITTEN);      /* erase usage bits if there is no referrer */
+  } /* for */
+
+  free(edge_pos);
+  free(edge_sym);
+  free(queued);
+  free(queue);
+  free(fill);
+  free(first);
+  free(live);
+  free(tabval);
+  free(tabkey);
+  free(syms);
 }
 
 #if !defined SC_LIGHT

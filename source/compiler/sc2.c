@@ -3109,6 +3109,73 @@ static void symbol_cache_remove(symbol *sym)
   } /* if */
 }
 
+/* The global symbol list is kept sorted by name (see add_symbol() below). Walking it from the head for
+ * every insertion costs O(n^2) over a program: a gamemode that pulls in YSI and the open.mp includes has
+ * ~100,000 global symbols, and this walk was a quarter of the whole compile time. To start the walk close
+ * to the insertion point, every ANCHOR_EVERY-th inserted symbol is also kept in an array that is sorted
+ * by name; the walk starts behind the last anchor whose name is smaller than the new one. The list that
+ * results is exactly the one the plain walk builds, because the index is only used where the plain walk cannot
+ * stop early. rename_symbol() keeps the list position of a renamed symbol (operators are renamed to names such
+ * as "40000005+40000005"), so the list is not sorted around such nodes. Every node that is out of order has a
+ * name that is not larger than the largest renamed name (glb_unsorted_max): it is either a renamed symbol or
+ * was inserted in front of one. A new symbol whose name is larger than that can not be stopped by any of those
+ * nodes, so for it the sorted nodes decide and the anchor index applies. Smaller names walk from the head.
+ */
+#define ANCHOR_EVERY 64
+static symbol **glb_anchor=NULL;
+static int glb_anchors=0,glb_anchor_cap=0;
+static char glb_unsorted_max[sNAMEMAX+1];   /* largest name given to a global symbol by rename_symbol() */
+static int glb_unsorted_set=0;
+static unsigned long glb_inserts=0;
+#ifdef PERF_TRACE
+static unsigned long perf_steps=0,perf_inserts=0,perf_indexed=0;
+#endif
+
+/* first anchor whose name is not smaller than "name" */
+static int anchor_lower_bound(const char *name)
+{
+  int lo=0,hi=glb_anchors;
+  while (lo<hi) {
+    int mid=lo+(hi-lo)/2;
+    if (strcmp(glb_anchor[mid]->name,name)<0)
+      lo=mid+1;
+    else
+      hi=mid;
+  } /* while */
+  return lo;
+}
+
+static void anchor_add(symbol *sym)
+{
+  int pos;
+
+  if (glb_anchors==glb_anchor_cap) {
+    int cap=(glb_anchor_cap==0) ? 256 : glb_anchor_cap*2;
+    symbol **p=(symbol **)realloc(glb_anchor,cap*sizeof(symbol *));
+    if (p==NULL)
+      return;                   /* no index; the plain walk still gives the right list */
+    glb_anchor=p;
+    glb_anchor_cap=cap;
+  } /* if */
+  pos=anchor_lower_bound(sym->name);
+  memmove(&glb_anchor[pos+1],&glb_anchor[pos],(glb_anchors-pos)*sizeof(symbol *));
+  glb_anchor[pos]=sym;
+  glb_anchors++;
+  sym->is_anchor=1;
+}
+
+static void anchor_remove(symbol *sym)
+{
+  int pos=anchor_lower_bound(sym->name);
+  while (pos<glb_anchors && glb_anchor[pos]!=sym && strcmp(glb_anchor[pos]->name,sym->name)==0)
+    pos++;
+  if (pos<glb_anchors && glb_anchor[pos]==sym) {
+    memmove(&glb_anchor[pos],&glb_anchor[pos+1],(glb_anchors-pos-1)*sizeof(symbol *));
+    glb_anchors--;
+  } /* if */
+  sym->is_anchor=0;
+}
+
 /* The local variable table must be searched backwards, so that the deepest
  * nesting of local variables is searched first. The simplest way to do
  * this is to insert all new items at the head of the list.
@@ -3118,10 +3185,30 @@ static void symbol_cache_remove(symbol *sym)
 static symbol *add_symbol(symbol *root,symbol *entry,int sort)
 {
   symbol *newsym;
+  int indexed=(sort && root==&glbtab && (!glb_unsorted_set || strcmp(entry->name,glb_unsorted_max)>0));
+
+  if (indexed) {
+    int pos=anchor_lower_bound(entry->name);
+    if (pos>0)
+      root=glb_anchor[pos-1];   /* its name is smaller: the insertion point lies behind it */
+  } /* if */
 
   if (sort)
-    while (root->next!=NULL && strcmp(entry->name,root->next->name)>0)
+    while (root->next!=NULL && strcmp(entry->name,root->next->name)>0) {
       root=root->next;
+#ifdef PERF_TRACE
+      perf_steps++;
+#endif
+    } /* while */
+#ifdef PERF_TRACE
+  if (sort && root!=NULL) {
+    perf_inserts++;
+    perf_indexed+=indexed;
+    if (perf_inserts%20000==0)
+      fprintf(stderr,"[perf] inserts=%lu indexed=%lu steps=%lu anchors=%d unsorted_max=%s\n",
+              perf_inserts,perf_indexed,perf_steps,glb_anchors,glb_unsorted_set ? glb_unsorted_max : "-");
+  } /* if */
+#endif
 
   if ((newsym=(symbol *)malloc(sizeof(symbol)))==NULL)
     error(103);
@@ -3129,8 +3216,12 @@ static symbol *add_symbol(symbol *root,symbol *entry,int sort)
   newsym->next=root->next;
   root->next=newsym;
   newsym->htnext=NULL;
+  newsym->is_anchor=0;
+  newsym->work=0;
   if (newsym->vclass==sGLOBAL)
     symbol_cache_add(newsym);
+  if (indexed && ++glb_inserts%ANCHOR_EVERY==0)
+    anchor_add(newsym);
   return newsym;
 }
 
@@ -3174,6 +3265,8 @@ static void free_symbol(symbol *sym)
   assert(sym->refer!=NULL);
   free(sym->refer);
   free(sym->documentation);
+  if (sym->is_anchor)
+    anchor_remove(sym);
   if (sym->vclass==sGLOBAL)
     symbol_cache_remove(sym);
   free(sym);
@@ -3302,8 +3395,17 @@ SC_FUNC void rename_symbol(symbol *sym,const char *newname)
 {
   const int isglobal=(sym->vclass==sGLOBAL);
 
-  if (isglobal)
+  if (isglobal) {
+    /* the list position stays, so the list is out of order around this node: remember the largest name */
+    if (!glb_unsorted_set || strcmp(newname,glb_unsorted_max)>0) {
+      strncpy(glb_unsorted_max,newname,sNAMEMAX);
+      glb_unsorted_max[sNAMEMAX]='\0';
+      glb_unsorted_set=1;
+    } /* if */
+    if (sym->is_anchor)
+      anchor_remove(sym);
     symbol_cache_remove(sym);
+  } /* if */
   strcpy(sym->name,newname);
   if (isglobal)
     symbol_cache_add(sym);

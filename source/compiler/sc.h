@@ -154,6 +154,8 @@ typedef struct s_symbol {
   struct s_symbol **refer;  /* referrer list, functions that "use" this symbol */
   int numrefers;        /* number of entries in the referrer list */
   char *documentation;  /* optional documentation string */
+  unsigned char is_anchor;  /* listed in the add_symbol() search index (sc2.c) */
+  int work;             /* scratch value of reduce_referrers() (sc1.c) */
 } symbol;
 
 

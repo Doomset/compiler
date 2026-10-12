@@ -2384,6 +2384,33 @@ SC_FUNC void lexinit(void)
   _lexnewline=FALSE;
 }
 
+/* lex() tried every operator and every reserved word at every token, 70 comparisons of the first character
+ * each. The tokens are grouped once by their first character; the groups keep the order of the table, and
+ * the first match wins as before.
+ */
+#define LEX_PER_CHAR 24
+static unsigned char lex_op_n[256],lex_kw_n[256];
+static short lex_op_i[256][LEX_PER_CHAR],lex_kw_i[256][LEX_PER_CHAR];
+static int lex_index_state=0;   /* 0: not built, 1: built, -1: does not fit, use the plain loops */
+
+static void lex_build_index(void)
+{
+  int i;
+  memset(lex_op_n,0,sizeof lex_op_n);
+  memset(lex_kw_n,0,sizeof lex_kw_n);
+  for (i=tFIRST; i<=tLAST; i++) {
+    unsigned char c=(unsigned char)sc_tokens[i-tFIRST][0];
+    unsigned char *count=(i<=tMIDDLE) ? &lex_op_n[c] : &lex_kw_n[c];
+    short *list=(i<=tMIDDLE) ? lex_op_i[c] : lex_kw_i[c];
+    if (*count>=LEX_PER_CHAR) {
+      lex_index_state=-1;
+      return;
+    } /* if */
+    list[(*count)++]=(short)i;
+  } /* for */
+  lex_index_state=1;
+}
+
 SC_FUNC int lex(cell *lexvalue,char **lexsym)
 {
   int i,toolong,newline,stringflags;
@@ -2432,6 +2459,37 @@ SC_FUNC int lex(cell *lexvalue,char **lexsym)
         stmtindent++;
   } /* if */
 
+  if (lex_index_state==0)
+    lex_build_index();
+  if (lex_index_state>0) {
+    const unsigned char c=*lptr;
+    int k;
+    for (k=0; k<lex_op_n[c]; k++) {         /* match multi-character operators */
+      i=lex_op_i[c][k];
+      tokptr=&sc_tokens[i-tFIRST];
+      if (match(*tokptr,FALSE)) {
+        _lextok=i;
+        if (pc_docexpr)   /* optionally concatenate to documentation string */
+          insert_autolist(*tokptr);
+        if (pc_isrecording)
+          rectok(*tokptr,iskipwspace);
+        return _lextok;
+      } /* if */
+    } /* for */
+    for (k=0; k<lex_kw_n[c]; k++) {         /* match reserved words and compiler directives */
+      i=lex_kw_i[c][k];
+      tokptr=&sc_tokens[i-tFIRST];
+      if (match(*tokptr,TRUE)) {
+        _lextok=i;
+        errorset(sRESET,0); /* reset error flag (clear the "panic mode")*/
+        if (pc_docexpr)   /* optionally concatenate to documentation string */
+          insert_autolist(*tokptr);
+        if (pc_isrecording)
+          rectok(*tokptr,iskipwspace);
+        return _lextok;
+      } /* if */
+    } /* for */
+  } else {
   i=tFIRST;
   tokptr=sc_tokens;
   while (i<=tMIDDLE) {  /* match multi-character operators */
@@ -2459,6 +2517,7 @@ SC_FUNC int lex(cell *lexvalue,char **lexsym)
     i+=1;
     tokptr+=1;
   } /* while */
+  } /* if (index) */
 
   starttoken=lptr;      /* save start pointer (for concatenating to documentation string) */
   if ((i=number(&_lexval,lptr))!=0) {   /* number */

@@ -50,7 +50,7 @@ SC_FUNC char* duplicatestring(const char* sourcestring)
 }
 
 
-static stringpair *insert_stringpair(stringpair *root,char *first,char *second,int matchlength)
+static stringpair *insert_stringpair_from(stringpair *root,stringpair *start,char *first,char *second,int matchlength)
 {
   stringpair *cur,*pred;
 
@@ -70,11 +70,17 @@ static stringpair *insert_stringpair(stringpair *root,char *first,char *second,i
     return NULL;
   } /* if */
   /* link the node to the tree, find the position */
-  for (pred=root; pred->next!=NULL && strcmp(pred->next->first,first)<0; pred=pred->next)
+  /* "start" is root, or a node of the list whose string is smaller than "first" */
+  for (pred=(start!=NULL) ? start : root; pred->next!=NULL && strcmp(pred->next->first,first)<0; pred=pred->next)
     /* nothing */;
   cur->next=pred->next;
   pred->next=cur;
   return cur;
+}
+
+static stringpair *insert_stringpair(stringpair *root,char *first,char *second,int matchlength)
+{
+  return insert_stringpair_from(root,NULL,first,second,matchlength);
 }
 
 static void delete_stringpairtable(stringpair *root)
@@ -113,12 +119,13 @@ static stringpair *find_stringpair(stringpair *cur,char *first,int matchlength)
   return NULL;
 }
 
-static int delete_stringpair(stringpair *root,stringpair *item)
+/* "start" is root, or a node that comes before "item" in the list */
+static int delete_stringpair_from(stringpair *root,stringpair *start,stringpair *item)
 {
   stringpair *cur;
 
   assert(root!=NULL);
-  cur=root;
+  cur=(start!=NULL) ? start : root;
   while (cur->next!=NULL) {
     if (cur->next==item) {
       cur->next=item->next;     /* unlink from list */
@@ -132,6 +139,11 @@ static int delete_stringpair(stringpair *root,stringpair *item)
     cur=cur->next;
   } /* while */
   return FALSE;
+}
+
+static int delete_stringpair(stringpair *root,stringpair *item)
+{
+  return delete_stringpair_from(root,NULL,item);
 }
 
 /* ----- string list functions ----------------------------------- */
@@ -259,15 +271,103 @@ SC_FUNC void delete_pathtable(void)
 static stringpair substpair = { NULL, NULL, NULL};  /* list of substitution pairs */
 
 static stringpair *substindex['z'-PUBLIC_CHAR+1]; /* quick index to first character */
+
+/* The list is sorted by string, so all strings that start with one character are together and the
+ * buckets follow each other in character order. A search for anything that starts with "c" can therefore
+ * begin at the head of the nearest lower bucket instead of at the head of the list: with the 20,000+
+ * macros that YSI and the open.mp includes define, every #define / #undef used to walk the whole list
+ * (twice). The list that results is the same.
+ */
+static stringpair *subst_before(char c)
+{
+  int k;
+  for (k=(int)c-PUBLIC_CHAR-1; k>=0; k--)
+    if (substindex[k]!=NULL)
+      return substindex[k];     /* every string up to and including its head is smaller than one with "c" */
+  return NULL;                  /* none: begin at the root */
+}
+
 static void adjustindex(char c)
 {
   stringpair *cur;
   assert(c>='A' && c<='Z' || c>='a' && c<='z' || c=='_' || c==PUBLIC_CHAR);
   assert(PUBLIC_CHAR<'A' && 'A'<'_' && '_'<'z');
 
-  for (cur=substpair.next; cur!=NULL && cur->first[0]!=c; cur=cur->next)
+  cur=subst_before(c);
+  cur=(cur!=NULL) ? cur : substpair.next;
+  for ( ; cur!=NULL && (unsigned char)cur->first[0]<(unsigned char)c; cur=cur->next)
     /* nothing */;
+  if (cur!=NULL && cur->first[0]!=c)
+    cur=NULL;                   /* sorted: nothing starts with "c" */
   substindex[(int)c-PUBLIC_CHAR]=cur;
+}
+
+/* Almost every identifier the compiler reads is not a macro, and finding that out meant walking the whole
+ * bucket of its first character. Every (length, prefix) key that was ever inserted is kept in a hash set
+ * (entries are never removed, so a deleted macro only costs a normal search); a key that is not in the set
+ * is certainly not in the list.
+ */
+static unsigned long long *subst_keys=NULL;
+static size_t subst_key_cap=0,subst_key_cnt=0;
+
+static unsigned long long subst_key(const char *s,int len)
+{
+  unsigned long long h=14695981039346656037ULL;
+  int i;
+  for (i=0; i<len; i++) {
+    h^=(unsigned char)s[i];
+    h*=1099511628211ULL;
+  } /* for */
+  h^=(unsigned long long)len;
+  h*=1099511628211ULL;
+  return h|1ULL;                /* 0 marks an empty slot */
+}
+
+static void subst_key_add(const char *s,int len)
+{
+  unsigned long long key=subst_key(s,len);
+  size_t i;
+  if ((subst_key_cnt+1)*2>subst_key_cap) {
+    size_t newcap=(subst_key_cap==0) ? 8192 : subst_key_cap*2;
+    unsigned long long *newkeys=(unsigned long long *)calloc(newcap,sizeof(unsigned long long));
+    size_t k;
+    if (newkeys==NULL) {
+      /* no memory for the set: drop it, find_subst() then always does the normal search */
+      free(subst_keys);
+      subst_keys=NULL;
+      subst_key_cap=subst_key_cnt=0;
+      return;
+    } /* if */
+    for (k=0; k<subst_key_cap; k++) {
+      if (subst_keys[k]!=0) {
+        for (i=(size_t)(subst_keys[k]>>7)&(newcap-1); newkeys[i]!=0; i=(i+1)&(newcap-1))
+          /* nothing */;
+        newkeys[i]=subst_keys[k];
+      } /* if */
+    } /* for */
+    free(subst_keys);
+    subst_keys=newkeys;
+    subst_key_cap=newcap;
+  } /* if */
+  for (i=(size_t)(key>>7)&(subst_key_cap-1); subst_keys[i]!=0; i=(i+1)&(subst_key_cap-1))
+    if (subst_keys[i]==key)
+      return;
+  subst_keys[i]=key;
+  subst_key_cnt++;
+}
+
+/* FALSE only when no macro with this length and prefix was inserted since the table was cleared */
+static int subst_key_may_exist(const char *s,int len)
+{
+  unsigned long long key;
+  size_t i;
+  if (subst_keys==NULL)
+    return TRUE;                /* set not available (or no macros yet): do the normal search */
+  key=subst_key(s,len);
+  for (i=(size_t)(key>>7)&(subst_key_cap-1); subst_keys[i]!=0; i=(i+1)&(subst_key_cap-1))
+    if (subst_keys[i]==key)
+      return TRUE;
+  return FALSE;
 }
 
 SC_FUNC stringpair *insert_subst(char *pattern,char *substitution,int prefixlen)
@@ -276,8 +376,9 @@ SC_FUNC stringpair *insert_subst(char *pattern,char *substitution,int prefixlen)
 
   assert(pattern!=NULL);
   assert(substitution!=NULL);
-  if ((cur=insert_stringpair(&substpair,pattern,substitution,prefixlen))==NULL)
+  if ((cur=insert_stringpair_from(&substpair,subst_before(*pattern),pattern,substitution,prefixlen))==NULL)
     error(103);       /* insufficient memory (fatal error) */
+  subst_key_add(pattern,prefixlen);
   adjustindex(*pattern);
   return cur;
 }
@@ -288,6 +389,8 @@ SC_FUNC stringpair *find_subst(char *name,int length)
   assert(name!=NULL);
   assert(length>0);
   assert(*name>='A' && *name<='Z' || *name>='a' && *name<='z' || *name=='_' || *name==PUBLIC_CHAR);
+  if (!subst_key_may_exist(name,length))
+    return NULL;
   item=substindex[(int)*name-PUBLIC_CHAR];
   if (item!=NULL)
     item=find_stringpair(item,name,length);
@@ -305,7 +408,7 @@ SC_FUNC int delete_subst(char *name,int length)
     item=find_stringpair(item,name,length);
   if (item==NULL)
     return FALSE;
-  delete_stringpair(&substpair,item);
+  delete_stringpair_from(&substpair,subst_before(*name),item);
   adjustindex(*name);
   return TRUE;
 }
@@ -316,6 +419,9 @@ SC_FUNC void delete_substtable(void)
   delete_stringpairtable(&substpair);
   for (i=0; i<arraysize(substindex); i++)
     substindex[i]=NULL;
+  free(subst_keys);
+  subst_keys=NULL;
+  subst_key_cap=subst_key_cnt=0;
 }
 
 #endif /* !defined NO_SUBST */

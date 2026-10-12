@@ -57,6 +57,27 @@ pawncc is single-threaded (98% of one core for the whole run), so the profile is
    `forward` declarations in the gamemode remove it; the generated program differs from the 2-pass build by one
    padding cell and the data addresses it shifts (checked cell by cell).
 
+## Phase breakdown (round 5 build, `-D PERF_TRACE`)
+
+`build-trace` prints the wall and thread-CPU time of every phase, plus the time spent inside `preprocess()`
+(reading lines, directives, macro substitution) and `stgout()` (peephole optimizer + asm text output).
+Gamemode, thread CPU seconds (machine loaded by an antivirus scan, so ~1.6x the quiet 13.2 s; the shares
+were the same in three runs):
+
+| Phase | CPU s | Share |
+|---|---:|---:|
+| first pass | 9.75 | 46% |
+| - of which `preprocess` | 4.30 | |
+| second pass | 8.48 | 40% |
+| - of which `preprocess` | 2.56 | |
+| - of which `stgout` | 0.64 | |
+| assembler: tables 0.08, labels 0.92 (4.8M instructions), code 0.73, data 1.11, debug 0.08 | 2.92 | 14% |
+| rest (testsymbols, max_stacksize, freeing) | ~0.2 | 1% |
+
+Threads would not pay off: the passes are strictly sequential, and the preprocessor cannot run ahead of the
+parser because `#if defined` sees symbols the parser has declared (YSI relies on it). Only the assembler (14%)
+could overlap with the second pass. The preprocessor (~1/3 of the total) is the next target.
+
 ## Remaining profile (not done)
 
 `stgwrite`/`assemble` text handling (the code generator writes text, the assembler parses it back three times),

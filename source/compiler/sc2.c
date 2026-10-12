@@ -2082,9 +2082,16 @@ static void substallpatterns(unsigned char *line,int buffersize)
 SC_FUNC void preprocess(void)
 {
   int iscommand;
+#ifdef PERF_TRACE
+  static int depth=0;
+  double t0=0;
+#endif
 
   if (!freading)
     return;
+#ifdef PERF_TRACE
+  if (depth++==0) t0=perf_now();
+#endif
   do {
     readline(pline);
     /* ??? no need for this when reading back from list file (in the second pass) */
@@ -2118,6 +2125,9 @@ SC_FUNC void preprocess(void)
         pc_writeasm(outf,(char*)pline);
     } /* if */
   } while (iscommand!=CMD_NONE && iscommand!=CMD_TERM && freading); /* enddo */
+#ifdef PERF_TRACE
+  if (--depth==0) perf_add(PERF_PREPROCESS,perf_now()-t0);
+#endif
 }
 
 static const unsigned char *unpackedstring(const unsigned char *lptr,int *flags)

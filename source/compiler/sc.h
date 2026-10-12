@@ -877,6 +877,15 @@ SC_FUNC void warnstack_init(void);
 SC_FUNC void warnstack_cleanup(void);
 SC_FUNC int error_suggest(int number,const char *name,const char *name2,int type,int subtype);
 
+#ifdef PERF_TRACE
+/* phase timing (sc1.c): perf_pass() prints the time since the previous mark and the
+ * accumulated preprocess()/stgout() time inside that phase */
+enum { PERF_PREPROCESS, PERF_STGOUT, PERF_NUM };
+SC_FUNC double perf_now(void);
+SC_FUNC void perf_pass(const char *what);
+SC_FUNC void perf_add(int slot,double seconds);
+#endif
+
 /* function prototypes in SC6.C */
 SC_FUNC int assemble(FILE *fout,FILE *fin);
 

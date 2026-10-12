@@ -1409,10 +1409,16 @@ SC_FUNC void stgout(int index)
 {
   int reordered=0;
   int idx;
+#ifdef PERF_TRACE
+  double t0;
+#endif
 
   if (!staging)
     return;
   assert(pipeidx==0);
+#ifdef PERF_TRACE
+  t0=perf_now();
+#endif
 
   /* first pass: sub-expressions */
   if (sc_status==statWRITE)
@@ -1435,6 +1441,9 @@ SC_FUNC void stgout(int index)
   if (stgidx<=emit_stgbuf_idx)
     emit_stgbuf_idx=-1;
   pipeidx=0;  /* reset second pipe */
+#ifdef PERF_TRACE
+  perf_add(PERF_STGOUT,perf_now()-t0);
+#endif
 }
 
 typedef struct {

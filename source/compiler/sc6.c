@@ -1054,6 +1054,9 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
   #endif
   pc_writebin(fout,&count,sizeof count);
   pc_resetbin(fout,hdr.cod);
+#ifdef PERF_TRACE
+  perf_pass("asm: header + name tables");
+#endif
 
   /* First pass: relocate all labels */
   /* This pass is necessary because the code addresses of labels is only known
@@ -1116,6 +1119,9 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
     } /* while */
   } /* if */
 
+#ifdef PERF_TRACE
+  { char msg[80]; sprintf(msg,"asm: label pass (%lu instr)",(unsigned long)rec_num); perf_pass(msg); }
+#endif
   /* Second pass (actually 2 more passes, one for all code and one for all data) */
   bytes_in=0;
   bytes_out=0;
@@ -1135,6 +1141,9 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
           /* nothing */;
         opcodelist[i].func(fout,skipwhitespace(params),opcodelist[i].opcode);
       } /* for */
+#ifdef PERF_TRACE
+      perf_pass(pass==sIN_CSEG ? "asm: code segment" : "asm: data segment");
+#endif
       continue;
     } /* if */
     pc_resetasm(fin);
@@ -1172,6 +1181,9 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
     hdr.size=pc_lengthbin(fout);/* get this value before appending debug info */
   if (!writeerror && (sc_debug & sSYMBOLIC)!=0)
     append_dbginfo(fout);       /* optionally append debug file */
+#ifdef PERF_TRACE
+  perf_pass("asm: debug info");
+#endif
 
   if (writeerror)
     error(101,"disk full");

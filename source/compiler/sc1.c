@@ -536,13 +536,42 @@ long pc_lengthbin(void *handle)
   extern "C"
 #endif
 #ifdef PERF_TRACE
-#include <time.h>
-static clock_t perf_mark=0;
-static void perf_pass(const char *what)
+static double perf_mark=0;
+static double perf_acc[PERF_NUM];
+SC_FUNC double perf_now(void)
 {
-  clock_t now=clock();
-  if (perf_mark==0) perf_mark=now;
-  fprintf(stderr,"[perf] %-34s +%6.2f s\n",what,(double)(now-perf_mark)/CLOCKS_PER_SEC);
+  static LARGE_INTEGER freq;
+  LARGE_INTEGER now;
+  if (freq.QuadPart==0)
+    QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&now);
+  return (double)now.QuadPart/(double)freq.QuadPart;
+}
+SC_FUNC void perf_add(int slot,double seconds)
+{
+  perf_acc[slot]+=seconds;
+}
+static double perf_cpu(void)
+{
+  FILETIME c,e,k,u;
+  GetThreadTimes(GetCurrentThread(),&c,&e,&k,&u);
+  return ((double)(((unsigned __int64)u.dwHighDateTime<<32)|u.dwLowDateTime)
+         +(double)(((unsigned __int64)k.dwHighDateTime<<32)|k.dwLowDateTime))/1e7;
+}
+static double perf_cpu_mark=0;
+SC_FUNC void perf_pass(const char *what)
+{
+  double now=perf_now();
+  double cpu=perf_cpu();
+  int i;
+  if (perf_mark==0) { perf_mark=now; perf_cpu_mark=cpu; }
+  fprintf(stderr,"[perf] %-38s +%6.3f s (cpu %6.3f s)",what,now-perf_mark,cpu-perf_cpu_mark);
+  perf_cpu_mark=cpu;
+  if (perf_acc[PERF_PREPROCESS]>0 || perf_acc[PERF_STGOUT]>0)
+    fprintf(stderr,"  (preprocess %.3f s, stgout %.3f s)",perf_acc[PERF_PREPROCESS],perf_acc[PERF_STGOUT]);
+  fprintf(stderr,"\n");
+  for (i=0; i<PERF_NUM; i++)
+    perf_acc[i]=0;
   perf_mark=now;
 }
 #endif
@@ -809,6 +838,9 @@ int pc_compile(int argc, char *argv[])
                                              * functions and variables */
   if (!entry)
     error(13);                  /* no entry point (no public functions) */
+#ifdef PERF_TRACE
+  perf_pass("writetrailer + testsymbols");
+#endif
 
 cleanup:
   if (inpf!=NULL) {             /* main source file is not closed, do it now */
@@ -868,6 +900,9 @@ cleanup:
         error(106,pc_amxlimit+pc_amxram); /* this causes a jump back to label "cleanup" */
     } /* if */
   #endif
+#ifdef PERF_TRACE
+  perf_pass("close files + max_stacksize");
+#endif
 
   if (get_sourcefile(1)!=NULL && tname!=NULL) {
     remove(tname);         /* the "input file" was in fact a temporary file */
@@ -906,6 +941,9 @@ cleanup:
   #endif
   delete_autolisttable();
   delete_heaplisttable();
+#ifdef PERF_TRACE
+  perf_pass("free tables");
+#endif
   if (errnum!=0) {
     if (strempty(errfname))
       pc_printf("\n%d Error%s.\n",errnum,(errnum>1) ? "s" : "");

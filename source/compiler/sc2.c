@@ -201,7 +201,6 @@ SC_FUNC int plungequalifiedfile(char *name,char new_extensions)
   unsigned int skipped_extensions = new_extensions ? 0 : 1;
   static char extensions[][6] = { "", ".inc", ".p", ".pawn", ".pwn" };
   int found;
-  struct stat st;
   FILE *fp;
   char *path;
   char *real_path;
@@ -243,9 +242,8 @@ SC_FUNC int plungequalifiedfile(char *name,char new_extensions)
 #endif
     fp=NULL;
     if (!path_is_missing(real_path)) {
-      /* a failing stat() means no such file: ignore directories with the same name */
-      if (stat(real_path, &st)==0 && !S_ISDIR(st.st_mode))
-        fp=(FILE*)pc_opensrc(real_path);
+      /* pc_opensrc() fails for a missing file and for a directory with the same name */
+      fp=(FILE*)pc_opensrc(real_path);
       if (fp==NULL)
         path_set_missing(real_path);
     } /* if */

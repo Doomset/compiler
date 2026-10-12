@@ -525,6 +525,17 @@ long pc_lengthbin(void *handle)
 #if defined __cplusplus
   extern "C"
 #endif
+#ifdef PERF_TRACE
+#include <time.h>
+static clock_t perf_mark=0;
+static void perf_pass(const char *what)
+{
+  clock_t now=clock();
+  if (perf_mark==0) perf_mark=now;
+  fprintf(stderr,"[perf] %-34s +%6.2f s\n",what,(double)(now-perf_mark)/CLOCKS_PER_SEC);
+  perf_mark=now;
+}
+#endif
 int pc_compile(int argc, char *argv[])
 {
   int entry,i,jmpcode;
@@ -640,6 +651,9 @@ int pc_compile(int argc, char *argv[])
       fline++;                  /* keep line number up to date */
   skipinput=fline;
   sc_status=statFIRST;
+#ifdef PERF_TRACE
+  perf_pass("startup (until first pass)");
+#endif
   /* do the first pass through the file (or possibly two or more "first passes") */
   sc_parsenum=0;
   inpfmark=pc_getpossrc(inpf_org);
@@ -679,6 +693,9 @@ int pc_compile(int argc, char *argv[])
     parse();                            /* process all input */
     warnstack_cleanup();
     sc_parsenum++;
+#ifdef PERF_TRACE
+    { char msg[64]; sprintf(msg,"first pass #%d done (reparse=%d)",sc_parsenum,sc_reparse); perf_pass(msg); }
+#endif
   } while (sc_reparse);
 
   /* second (or third) pass */
@@ -770,6 +787,9 @@ int pc_compile(int argc, char *argv[])
   preprocess();                         /* fetch first line */
   parse();                              /* process all input */
   warnstack_cleanup();
+#ifdef PERF_TRACE
+  perf_pass("second pass (code generation)");
+#endif
   if (sc_listing)
     goto cleanup;
   /* inpf is already closed when readline() attempts to pop of a file */
@@ -793,6 +813,9 @@ cleanup:
       hdrsize=
     #endif
     assemble(binf,outf);        /* assembler file is now input */
+#ifdef PERF_TRACE
+    perf_pass("assemble + write AMX");
+#endif
   } /* if */
   if (outf!=NULL) {
     pc_closeasm(outf,!(sc_asmfile || sc_listing));
@@ -5181,12 +5204,19 @@ static long max_stacksize_recurse(symbol **sourcesym,symbol *sym,symbol **rsourc
 {
   long size,maxsize;
   int i,stkpos;
+  int sub_recursion=FALSE;
 
   assert(sourcesym!=NULL);
   assert(sym!=NULL);
   assert(sym->ident==iFUNCTN);
   assert((sym->usage & uNATIVE)==0);
   assert(recursion!=NULL);
+
+  /* A sub-tree without recursion does not depend on the functions above it on the stack, so its result is
+   * computed once instead of once per path that reaches it. (The public-parameter maximum was already taken
+   * when the sub-tree was walked the first time.) */
+  if (sym->memo_valid)
+    return sym->memo_stack+basesize;
 
   maxsize=sym->x.stacksize;
   for (i=0; i<sym->numrefers; i++) {
@@ -5198,6 +5228,7 @@ static long max_stacksize_recurse(symbol **sourcesym,symbol *sym,symbol **rsourc
       for (stkpos=0; sourcesym[stkpos]!=NULL; stkpos++) {
         if (sym->refer[i]==sourcesym[stkpos]) {   /* recursion detection */
           *recursion=TRUE;
+          sub_recursion=TRUE;
           goto break_recursion;         /* recursion was detected, quit loop */
         } /* if */
       } /* for */
@@ -5205,7 +5236,14 @@ static long max_stacksize_recurse(symbol **sourcesym,symbol *sym,symbol **rsourc
       sourcesym[stkpos]=sym;
       sourcesym[stkpos+1]=NULL;
       /* check size of callee */
-      size=max_stacksize_recurse(sourcesym,sym->refer[i],rsourcesym+1,sym->x.stacksize,pubfuncparams,recursion);
+      {
+        int child_recursion=FALSE;
+        size=max_stacksize_recurse(sourcesym,sym->refer[i],rsourcesym+1,sym->x.stacksize,pubfuncparams,&child_recursion);
+        if (child_recursion) {
+          *recursion=TRUE;
+          sub_recursion=TRUE;
+        } /* if */
+      }
       if (maxsize<size)
         maxsize=size;
       /* remove this symbol from the stack */
@@ -5230,6 +5268,10 @@ static long max_stacksize_recurse(symbol **sourcesym,symbol *sym,symbol **rsourc
       *pubfuncparams=count;
   } /* if */
 
+  if (!sub_recursion) {
+    sym->memo_stack=maxsize;
+    sym->memo_valid=1;
+  } /* if */
   return maxsize+basesize;
 }
 
@@ -5257,6 +5299,7 @@ static long max_stacksize(symbol *root,int *recursion)
   for (sym=root->next; sym!=NULL; sym=sym->next) {
     if (sym->ident==iFUNCTN) {
       assert(sym->compound==0);
+      sym->memo_valid=0;
       if ((sym->usage & uNATIVE)==0)
         numfunctions++;
     } /* if */

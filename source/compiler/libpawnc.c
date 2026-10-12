@@ -27,6 +27,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include "sc.h"
 
 #if defined PAWNC_DLL
@@ -162,9 +164,91 @@ int pc_error(int number,char *message,char *filename,int firstline,int lastline,
  *    Several "source files" may be open at the same time. Specifically, one
  *    file can be open for reading and another for writing.
  */
+/* Source files are loaded into memory once and kept for the whole run: every pass, every re-included file
+ * and scan_utf8() read the same bytes, and fgets() on a FILE* (lock, per-line CRT work) was ~10% of a compile.
+ * Semantics follow a text-mode fopen(): "\r\n" becomes "\n" and ^Z ends the data.
+ */
+typedef struct tagSRCFILE {
+  FILE *fp;                     /* write handle (pc_createsrc/pc_createtmpsrc), NULL for a read handle */
+  const char *data;
+  size_t size,pos;
+  int eof;                      /* set like feof(): only after a read ran into the end of the data */
+} SRCFILE;
+
+typedef struct tagSRCCACHE {
+  struct tagSRCCACHE *next;
+  char *data;
+  size_t size;
+  char name[1];
+} SRCCACHE;
+#define SRCCACHE_BUCKETS 4096
+static SRCCACHE *srccache[SRCCACHE_BUCKETS];
+
+static unsigned srccache_hash(const char *s)
+{
+  unsigned h=5381;
+  while (*s!='\0')
+    h=h*33u+(unsigned char)*s++;
+  return h&(SRCCACHE_BUCKETS-1);
+}
+
+static SRCCACHE *srccache_load(const char *filename)
+{
+  unsigned h=srccache_hash(filename);
+  SRCCACHE *e;
+  FILE *fp;
+  struct stat st;
+  long len;
+  char *raw;
+  size_t n,i,o;
+
+  for (e=srccache[h]; e!=NULL; e=e->next)
+    if (strcmp(e->name,filename)==0)
+      return e;
+  if (stat(filename,&st)!=0 || (st.st_mode & S_IFDIR)!=0)
+    return NULL;                /* no such file; a directory with the same name is not a source file */
+  if ((fp=fopen(filename,"rb"))==NULL)
+    return NULL;
+  fseek(fp,0L,SEEK_END);
+  len=ftell(fp);
+  fseek(fp,0L,SEEK_SET);
+  if (len<0 || (raw=(char *)malloc((size_t)len+1))==NULL) {
+    fclose(fp);
+    return NULL;
+  } /* if */
+  n=fread(raw,1,(size_t)len,fp);
+  fclose(fp);
+  /* text-mode translation, in place */
+  for (i=o=0; i<n; i++) {
+    if (raw[i]=='\x1a')
+      break;
+    if (raw[i]=='\r' && i+1<n && raw[i+1]=='\n')
+      continue;
+    raw[o++]=raw[i];
+  } /* for */
+  raw[o]='\0';
+  if ((e=(SRCCACHE *)malloc(sizeof(SRCCACHE)+strlen(filename)))==NULL) {
+    free(raw);
+    return NULL;
+  } /* if */
+  strcpy(e->name,filename);
+  e->data=raw;
+  e->size=o;
+  e->next=srccache[h];
+  srccache[h]=e;
+  return e;
+}
+
 void *pc_opensrc(char *filename)
 {
-  return fopen(filename,"rt");
+  SRCCACHE *e=srccache_load(filename);
+  SRCFILE *f;
+
+  if (e==NULL || (f=(SRCFILE *)calloc(1,sizeof(SRCFILE)))==NULL)
+    return NULL;
+  f->data=e->data;
+  f->size=e->size;
+  return f;
 }
 
 /* pc_createsrc()
@@ -179,9 +263,19 @@ void *pc_opensrc(char *filename)
  *    Several "source files" may be open at the same time. Specifically, one
  *    file can be open for reading and another for writing.
  */
+static void *srcfile_wrap(FILE *fp)
+{
+  SRCFILE *f;
+
+  if (fp==NULL || (f=(SRCFILE *)calloc(1,sizeof(SRCFILE)))==NULL)
+    return NULL;
+  f->fp=fp;
+  return f;
+}
+
 void *pc_createsrc(char *filename)
 {
-  return fopen(filename,"wt");
+  return srcfile_wrap(fopen(filename,"wt"));
 }
 
 /* pc_createtmpsrc()
@@ -217,7 +311,7 @@ void *pc_createtmpsrc(char **filename)
   #endif
   if (filename!=NULL)
     *filename=tname;
-  return ftmp;
+  return srcfile_wrap(ftmp);
 }
 
 /* pc_closesrc()
@@ -226,8 +320,12 @@ void *pc_createtmpsrc(char **filename)
  */
 void pc_closesrc(void *handle)
 {
+  SRCFILE *f=(SRCFILE *)handle;
+
   assert(handle!=NULL);
-  fclose((FILE*)handle);
+  if (f->fp!=NULL)
+    fclose(f->fp);
+  free(f);
 }
 
 /* pc_resetsrc()
@@ -236,8 +334,11 @@ void pc_closesrc(void *handle)
  */
 void pc_resetsrc(void *handle,void *position)
 {
+  SRCFILE *f=(SRCFILE *)handle;
+
   assert(handle!=NULL);
-  fsetpos((FILE*)handle,(fpos_t *)position);
+  f->pos=*(size_t *)position;
+  f->eof=0;
 }
 
 /* pc_readsrc()
@@ -246,7 +347,33 @@ void pc_resetsrc(void *handle,void *position)
  */
 char *pc_readsrc(void *handle,unsigned char *target,int maxchars)
 {
-  return fgets((char*)target,maxchars,(FILE*)handle);
+  SRCFILE *f=(SRCFILE *)handle;
+  size_t avail,n;
+  const char *nl;
+
+  if (maxchars<=0)
+    return NULL;
+  avail=f->size-f->pos;
+  if (avail==0) {
+    f->eof=1;
+    return NULL;
+  } /* if */
+  n=(size_t)(maxchars-1);       /* fgets() stops one short of maxchars */
+  if (n==0) {
+    *target='\0';
+    return (char*)target;
+  } /* if */
+  if (n>avail)
+    n=avail;
+  nl=(const char *)memchr(f->data+f->pos,'\n',n);
+  if (nl!=NULL)
+    n=(size_t)(nl-(f->data+f->pos))+1;
+  else if (avail<(size_t)(maxchars-1))
+    f->eof=1;                   /* fgets() ran into the end without finding a newline */
+  memcpy(target,f->data+f->pos,n);
+  target[n]='\0';
+  f->pos+=n;
+  return (char*)target;
 }
 
 /* pc_writesrc()
@@ -255,20 +382,20 @@ char *pc_readsrc(void *handle,unsigned char *target,int maxchars)
  */
 int pc_writesrc(void *handle,unsigned char *source)
 {
-  return fputs((char*)source,(FILE*)handle) >= 0;
+  return fputs((char*)source,((SRCFILE *)handle)->fp) >= 0;
 }
 
 void *pc_getpossrc(void *handle)
 {
-  static fpos_t lastpos;  /* may need to have a LIFO stack of such positions */
+  static size_t lastpos;  /* may need to have a LIFO stack of such positions */
 
-  fgetpos((FILE*)handle,&lastpos);
+  lastpos=((SRCFILE *)handle)->pos;
   return &lastpos;
 }
 
 int pc_eofsrc(void *handle)
 {
-  return feof((FILE*)handle);
+  return ((SRCFILE *)handle)->eof;
 }
 
 /* should return a pointer, which is used as a "magic cookie" to all I/O
@@ -340,8 +467,23 @@ void *pc_openbin(char *filename)
   return fbin;
 }
 
+/* The AMX is written one small piece per cell (15 million calls for a large gamemode). Pieces are collected in a
+ * buffer of our own; every other operation on the binary file flushes it first.
+ */
+static unsigned char binbuf[1<<16];
+static size_t binbuf_len=0;
+
+static void binbuf_flush(FILE *fp)
+{
+  if (binbuf_len>0) {
+    fwrite(binbuf,1,binbuf_len,fp);
+    binbuf_len=0;
+  } /* if */
+}
+
 void pc_closebin(void *handle,int deletefile)
 {
+  binbuf_flush((FILE*)handle);
   fclose((FILE*)handle);
   if (deletefile)
     remove(binfname);
@@ -353,6 +495,7 @@ void pc_closebin(void *handle,int deletefile)
  */
 void pc_resetbin(void *handle,long offset)
 {
+  binbuf_flush((FILE*)handle);
   fflush((FILE*)handle);
   fseek((FILE*)handle,offset,SEEK_SET);
 }
@@ -361,6 +504,20 @@ int pc_writebin(void *handle,void *buffer,int size)
 {
   /* The compiler is single-threaded: the per-call stream lock of fwrite() was ~8% of a large compile
    * (one call per cell of the AMX). */
+  if (size>0 && (size_t)size<=sizeof binbuf) {
+    if (binbuf_len+(size_t)size>sizeof binbuf) {
+      /* a failed write is reported by the call that hits it, like with an unbuffered stream */
+      size_t written=fwrite(binbuf,1,binbuf_len,(FILE*)handle);
+      int ok=(written==binbuf_len);
+      binbuf_len=0;
+      if (!ok)
+        return 0;
+    } /* if */
+    memcpy(binbuf+binbuf_len,buffer,(size_t)size);
+    binbuf_len+=(size_t)size;
+    return 1;
+  } /* if */
+  binbuf_flush((FILE*)handle);
   #if defined _MSC_VER
     return (int)_fwrite_nolock(buffer,1,size,(FILE*)handle) == size;
   #else
@@ -370,5 +527,6 @@ int pc_writebin(void *handle,void *buffer,int size)
 
 long pc_lengthbin(void *handle)
 {
+  binbuf_flush((FILE*)handle);
   return ftell((FILE*)handle);
 }

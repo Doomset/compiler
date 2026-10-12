@@ -156,6 +156,8 @@ typedef struct s_symbol {
   char *documentation;  /* optional documentation string */
   unsigned char is_anchor;  /* listed in the add_symbol() search index (sc2.c) */
   int work;             /* scratch value of reduce_referrers() (sc1.c) */
+  long memo_stack;      /* max_stacksize_recurse(): result for this function and everything it calls */
+  unsigned char memo_valid;
 } symbol;
 
 

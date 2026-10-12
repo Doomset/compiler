@@ -41,11 +41,25 @@ pawncc is single-threaded (98% of one core for the whole run), so the profile is
    `lex()` compared every operator and reserved word with the first character of every token; the tokens are
    now grouped once by first character, in table order.
 
+4. Round 4 (after removing the forced re-parse pass in the gamemode itself, see below): 16.7 s -> 13.9 s.
+   * Source files are read once into memory (`libpawnc.c`: `pc_opensrc` & co.), with text-mode semantics
+     (`
+` -> `
+`, `^Z` ends the data, `feof` only after a read ran into the end). Every pass and every
+     re-included file reuses the buffer; `plungequalifiedfile` no longer calls `stat`.
+   * The AMX is written through a 64 KB buffer of its own (15 million tiny `fwrite`s before).
+   * `findopcode` is a hash lookup on the lower-case name (the assembler calls it three times per asm line).
+   * `max_stacksize_recurse` walked every call path again; a sub-tree without recursion is now computed once.
+
+   The biggest single gain is not in the compiler: `check_reparse()` raises warning 208 and a whole extra
+   first pass (~6 s) when a function with a tag is called before it is defined and has no prototype. Two
+   `forward` declarations in the gamemode remove it; the generated program differs from the 2-pass build by one
+   padding cell and the data addresses it shifts (checked cell by cell).
+
 ## Remaining profile (not done)
 
-Line reading with `fgets` (the UCRT reads character by character; ~7%), the include search that still
-reaches the file system (~3%), `stgwrite`/`assemble` text handling, and reading the same include files again
-in the second pass (an in-memory source cache would remove most of it but must emulate text-mode reads).
+`stgwrite`/`assemble` text handling (the code generator writes text, the assembler parses it back three times),
+`lex`/`substpattern` on the YSI-heavy sources, and `find_stringpair`.
 
 ## Tools
 

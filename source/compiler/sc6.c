@@ -701,38 +701,54 @@ static OPCODE opcodelist[] = {
   { 92, "zero.s",     sIN_CSEG, parm1 },
 };
 
+/* The assembler looks an instruction up once per line of the intermediate file, three times over. A hash table
+ * on the lower-case name replaces the copy + binary search of strcmp()s. */
+#define OPCODE_HASH_SIZE 1024   /* a power of two, more than twice the number of opcodes */
+static short opcode_hash[OPCODE_HASH_SIZE];
+static int opcode_hash_ready=0;
+
+static unsigned opcode_hash_char(unsigned h,unsigned char c)
+{
+  if (c>='A' && c<='Z')
+    c=(unsigned char)(c-'A'+'a');
+  return (h^c)*16777619u;
+}
+
 static int findopcode(char *instr,int maxlen)
 {
-  int low,high,mid,cmp,k;
-  char str[MAX_INSTR_LEN];
+  unsigned h;
+  int k;
 
   if (maxlen>=MAX_INSTR_LEN)
     return 0;
-  strlcpy(str,instr,maxlen+1);
-  /* the table is all lower case: fold the instruction once instead of comparing case-insensitively
-   * at every step of the search */
-  for (k=0; str[k]!='\0'; k++)
-    if (str[k]>='A' && str[k]<='Z')
-      str[k]=(char)(str[k]-'A'+'a');
-  /* look up the instruction with a binary search
-   * the assembler is case insensitive to instructions (but case sensitive
-   * to symbols)
-   */
-  low=1;                /* entry 0 is reserved (for "not found") */
-  high=arraysize(opcodelist)-1;
-  while (low<high) {
-    mid=(low+high)/2;
-    assert(opcodelist[mid].name!=NULL);
-    cmp=strcmp(str,opcodelist[mid].name);
-    if (cmp>0)
-      low=mid+1;
-    else
-      high=mid;
-  } /* while */
-
-  assert(low==high);
-  if (strcmp(str,opcodelist[low].name)==0)
-    return low;         /* found */
+  if (!opcode_hash_ready) {
+    int n;
+    for (n=1; n<(int)arraysize(opcodelist); n++) {
+      const char *name=opcodelist[n].name;
+      h=2166136261u;
+      for (k=0; name[k]!='\0'; k++)
+        h=opcode_hash_char(h,(unsigned char)name[k]);
+      for (h&=OPCODE_HASH_SIZE-1; opcode_hash[h]!=0; h=(h+1)&(OPCODE_HASH_SIZE-1))
+        /* nothing */;
+      opcode_hash[h]=(short)n;
+    } /* for */
+    opcode_hash_ready=1;
+  } /* if */
+  h=2166136261u;
+  for (k=0; k<maxlen; k++)
+    h=opcode_hash_char(h,(unsigned char)instr[k]);
+  for (h&=OPCODE_HASH_SIZE-1; opcode_hash[h]!=0; h=(h+1)&(OPCODE_HASH_SIZE-1)) {
+    const char *name=opcodelist[opcode_hash[h]].name;
+    for (k=0; k<maxlen; k++) {
+      char c=instr[k];
+      if (c>='A' && c<='Z')
+        c=(char)(c-'A'+'a');
+      if (name[k]!=c)
+        break;
+    } /* for */
+    if (k==maxlen && name[k]=='\0')
+      return opcode_hash[h];
+  } /* for */
   return 0;             /* not found, return special index */
 }
 

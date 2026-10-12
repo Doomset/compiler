@@ -454,6 +454,16 @@ void pc_resetasm(void *handle)
   #endif
 }
 
+long pc_seekasm(void *handle,long offset)
+{
+  #if defined __MSDOS__ || defined SC_LIGHT
+    fseek((FILE*)handle,offset,SEEK_SET);
+  #else
+    mfseek((MEMFILE*)handle,offset,SEEK_SET);
+  #endif
+  return offset;
+}
+
 int pc_writeasm(void *handle,char *string)
 {
   #if defined __MSDOS__ || defined SC_LIGHT

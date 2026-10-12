@@ -674,6 +674,7 @@ int  pc_eofsrc(void *handle);
 void *pc_openasm(char *filename); /* read/write */
 void pc_closeasm(void *handle,int deletefile);
 void pc_resetasm(void *handle);
+long pc_seekasm(void *handle,long offset);
 int  pc_writeasm(void *handle,char *str);
 char *pc_readasm(void *handle,char *string,int maxchars);
 

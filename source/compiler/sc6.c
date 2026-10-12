@@ -752,6 +752,12 @@ static int findopcode(char *instr,int maxlen)
   return 0;             /* not found, return special index */
 }
 
+/* Every instruction line of the intermediate file, recorded by the first assembler pass. File scope, because
+ * the compact-encoding fallback longjmp()s back to the top of assemble(). */
+static long *rec_off=NULL;              /* offset of the line in the intermediate file */
+static unsigned short *rec_op=NULL;     /* ... and its index in opcodelist */
+static size_t rec_num=0,rec_cap=0;
+
 SC_FUNC int assemble(FILE *fout,FILE *fin)
 {
   AMX_HEADER hdr;
@@ -764,6 +770,8 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
     char line[256];
   #endif
   char *instr,*params;
+  size_t k;
+  long linepos;
   int i,pass,size;
   int16_t count;
   symbol *sym, **nativelist;
@@ -778,6 +786,7 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
     pc_resetbin(fout,0);
     error(232);           /* disabled compact encoding */
   } /* if */
+  rec_num=0;
 
   #if !defined NDEBUG
     /* verify that the opcode list is sorted (skip entry 1; it is reserved
@@ -1060,7 +1069,10 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
       error(103);               /* insufficient memory */
     codeindex=0;
     pc_resetasm(fin);
+    linepos=0;
     while (pc_readasm(fin,line,sizeof line)!=NULL) {
+      long thispos=linepos;
+      linepos+=(long)strlen(line);
       stripcomment(line);
       instr=skipwhitespace(line);
       /* ignore empty lines */
@@ -1082,6 +1094,22 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
           *params='\0';
           error(104,instr);     /* invalid assembler instruction */
         } /* if */
+        if (rec_num==rec_cap) {
+          size_t newcap=(rec_cap==0) ? 65536 : rec_cap*2;
+          long *newoff=(long *)realloc(rec_off,newcap*sizeof *rec_off);
+          unsigned short *newop;
+          if (newoff!=NULL)
+            rec_off=newoff;
+          newop=(unsigned short *)realloc(rec_op,newcap*sizeof *rec_op);
+          if (newop!=NULL)
+            rec_op=newop;
+          if (newoff==NULL || newop==NULL)
+            error(103);         /* insufficient memory */
+          rec_cap=newcap;
+        } /* if */
+        rec_off[rec_num]=thispos;
+        rec_op[rec_num]=(unsigned short)i;
+        rec_num++;
         if (opcodelist[i].segment==sIN_CSEG)
           codeindex+=opcodelist[i].func(NULL,skipwhitespace(params),opcodelist[i].opcode);
       } /* if */
@@ -1092,6 +1120,23 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
   bytes_in=0;
   bytes_out=0;
   for (pass=sIN_CSEG; pass<=sIN_DSEG; pass++) {
+    if (lbltab!=NULL) {
+      /* the first pass recorded every instruction line: no need to lex the whole file again for each segment */
+      for (k=0; k<rec_num; k++) {
+        i=rec_op[k];
+        if (opcodelist[i].segment!=pass)
+          continue;
+        pc_seekasm(fin,rec_off[k]);
+        if (pc_readasm(fin,line,sizeof line)==NULL)
+          break;
+        stripcomment(line);
+        instr=skipwhitespace(line);
+        for (params=instr; *params!='\0' && !isspace(*params); params++)
+          /* nothing */;
+        opcodelist[i].func(fout,skipwhitespace(params),opcodelist[i].opcode);
+      } /* for */
+      continue;
+    } /* if */
     pc_resetasm(fin);
     while (pc_readasm(fin,line,sizeof line)!=NULL) {
       stripcomment(line);

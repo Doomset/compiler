@@ -1,4 +1,4 @@
-# Compile-time performance work (branch `perf/symbol-table`)
+﻿# Compile-time performance work (branch `perf/symbol-table`)
 
 Target: a 34 MB Pawn gamemode (YSI + open.mp includes, ~100,000 global symbols, 75 MB AMX with `-d3`).
 Machine: Xeon E5-2690 v3 @ 2.6 GHz, Windows 10, MSVC 2022 (Win32, Release, `sNAMEMAX=63` as in the official CI).
@@ -51,6 +51,7 @@ pawncc is single-threaded (98% of one core for the whole run), so the profile is
    * `findopcode` is a hash lookup on the lower-case name (the assembler calls it three times per asm line).
    * `max_stacksize_recurse` walked every call path again; a sub-tree without recursion is now computed once.
 
+   * Round 5: `mfgets` copies just the line (it copied 256 bytes and seeked back); the assembler's first pass records\n     every instruction line, so the code and data passes no longer lex the whole file again. 13.9 s -> 13.2 s.\n
    The biggest single gain is not in the compiler: `check_reparse()` raises warning 208 and a whole extra
    first pass (~6 s) when a function with a tag is called before it is defined and has no prototype. Two
    `forward` declarations in the gamemode remove it; the generated program differs from the 2-pass build by one
@@ -74,3 +75,4 @@ pawncc is single-threaded (98% of one core for the whole run), so the profile is
 1. Build the unmodified compiler and the changed one.
 2. Compile the same sources with both (same output name length and options) and run `compare_amx.py`.
 3. `ctest --test-dir <build> -j8` must give the same pass/fail set on both builds.
+

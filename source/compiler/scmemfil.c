@@ -118,38 +118,24 @@ unsigned int mfread(MEMFILE *mf,unsigned char *buffer,unsigned int size)
 
 char *mfgets(MEMFILE *mf,char *string,unsigned int size)
 {
-  char *ptr;
-  unsigned int read;
-  long seek;
+  long avail;
+  const char *start,*nl;
+  unsigned int len;
 
   assert(mf!=NULL);
-
-  read=mfread(mf,(unsigned char *)string,size);
-  if (read==0)
+  avail=mf->usedoffs-mf->offs;
+  if (size<2 || avail<=0)
     return NULL;
-  seek=0L;
-
-  /* make sure that the string is zero-terminated */
-  assert(read<=size);
-  if (read<size) {
-    string[read]='\0';
-  } else {
-    string[size-1]='\0';
-    seek=-1;            /* undo reading the character that gets overwritten */
-  } /* if */
-
-  /* find the first '\n' */
-  ptr=strchr(string,'\n');
-  if (ptr!=NULL) {
-    *(ptr+1)='\0';
-    seek=(long)(ptr-string)+1-(long)read;
-  } /* if */
-
-  /* undo over-read */
-  assert(seek<=0);      /* should seek backward only */
-  if (seek!=0)
-    mfseek(mf,seek,SEEK_CUR);
-
+  start=mf->base+mf->offs;
+  len=size-1;                   /* leave room for the terminator, like fgets() */
+  if ((long)len>avail)
+    len=(unsigned int)avail;
+  nl=(const char *)memchr(start,'\n',len);
+  if (nl!=NULL)
+    len=(unsigned int)(nl-start)+1;
+  memcpy(string,start,len);
+  string[len]='\0';
+  mf->offs+=(long)len;
   return string;
 }
 

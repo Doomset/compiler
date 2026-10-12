@@ -9,7 +9,8 @@ Machine: Xeon E5-2690 v3 @ 2.6 GHz, Windows 10, MSVC 2022 (Win32, Release, `sNAM
 |---|---|---|
 | unmodified `master` (29f1a8c) | 58.9 s | reference |
 | + round 1 (`a9d0e62`) | ~35 s | identical |
-| + round 2 (`8582b56`) | **30.2 s** | identical |
+| + round 2 (`8582b56`) | 30.2 s | identical |
+| + round 3 (`79d1535`) | **22.1 s** | identical |
 
 "Identical" means byte for byte except the compile time string that Pawn embeds (`tools/compare_amx.py`
 reports it as a time string). `ctest` gives the same result as the unmodified build: 90 of 93 tests pass,
@@ -33,10 +34,18 @@ pawncc is single-threaded (98% of one core for the whole run), so the profile is
      `stat` was ignored) -> a failing `stat` ends the try, missing paths are remembered by exact string.
    * `findopcode`: `stricmp` at every binary search step -> fold to lower case once, `strcmp`.
 
+3. Round 3, the macro table (20,000+ macros): `#define`/`#undef` walked the whole sorted list twice
+   (`adjustindex`, `insert_stringpair`, `delete_stringpair`) and every identifier walked the bucket of its first
+   character. All three now start at the head of the nearest lower bucket, and `find_subst` asks a hash set of
+   `(length, prefix)` keys first (keys are never removed, so a hit always runs the original search).
+   `lex()` compared every operator and reserved word with the first character of every token; the tokens are
+   now grouped once by first character, in table order.
+
 ## Remaining profile (not done)
 
-`lex` ~10%, `find_stringpair`/`insert_stringpair`/`insert_subst` ~12% (the macro substitution table is a
-linear list), repeated reading of the same include files in both passes.
+Line reading with `fgets` (the UCRT reads character by character; ~7%), the include search that still
+reaches the file system (~3%), `stgwrite`/`assemble` text handling, and reading the same include files again
+in the second pass (an in-memory source cache would remove most of it but must emulate text-mode reads).
 
 ## Tools
 

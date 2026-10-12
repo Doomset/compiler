@@ -359,7 +359,13 @@ void pc_resetbin(void *handle,long offset)
 
 int pc_writebin(void *handle,void *buffer,int size)
 {
-  return (int)fwrite(buffer,1,size,(FILE*)handle) == size;
+  /* The compiler is single-threaded: the per-call stream lock of fwrite() was ~8% of a large compile
+   * (one call per cell of the AMX). */
+  #if defined _MSC_VER
+    return (int)_fwrite_nolock(buffer,1,size,(FILE*)handle) == size;
+  #else
+    return (int)fwrite(buffer,1,size,(FILE*)handle) == size;
+  #endif
 }
 
 long pc_lengthbin(void *handle)

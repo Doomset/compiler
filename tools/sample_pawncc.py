@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import os
 import subprocess
 import sys
 import time
@@ -105,10 +106,12 @@ def main():
     tid = tids[0]
     hthr = k32.OpenThread(THREAD_ALL, False, tid)
     ctx = ctypes.create_string_buffer(CTX_SIZE)
-    stack = ctypes.create_string_buffer(16384)
+    STACK_MAX = 65536
+    stack = ctypes.create_string_buffer(STACK_MAX)
     selfc, incl, total = collections.Counter(), collections.Counter(), 0
     outside = 0
     cache = {}
+    tags = {}
 
     def sym(addr):
         if addr in cache:
@@ -119,8 +122,25 @@ def main():
         disp = ctypes.c_uint64()
         ok = dbg.SymFromAddrW(hproc, ctypes.c_uint64(addr), ctypes.byref(disp), ctypes.byref(si))
         cache[addr] = si.Name if ok else f"?{addr - base:#x}"
+        tags[addr] = si.Tag if ok else -1       # 5 = SymTagFunction; data symbols are not return addresses
         return cache[addr]
 
+    # address ranges of every loaded module, to name the samples that land outside pawnc.dll
+    class MODULEINFO(ctypes.Structure):
+        _fields_ = [("lpBaseOfDll", ctypes.c_void_p), ("SizeOfImage", wt.DWORD), ("EntryPoint", ctypes.c_void_p)]
+
+    def module_ranges():
+        out = []
+        for path, hmod in modules(hproc).items():
+            mi = MODULEINFO()
+            if psapi.GetModuleInformation(hproc, ctypes.c_void_p(hmod), ctypes.byref(mi), ctypes.sizeof(mi)):
+                out.append((mi.lpBaseOfDll or 0, mi.SizeOfImage, path.rsplit("\\", 1)[-1]))
+        return out
+
+    time.sleep(0.5)
+    ranges = module_ranges()
+    outside_by_module = collections.Counter()
+    outside_callers = collections.Counter()
     t0 = time.time()
     while proc.poll() is None:
         if k32.SuspendThread(hthr) == 0xFFFFFFFF:
@@ -131,7 +151,11 @@ def main():
             eip = ctypes.c_uint32.from_buffer(ctx, OFF_EIP).value
             esp = ctypes.c_uint32.from_buffer(ctx, OFF_ESP).value
             n = ctypes.c_size_t()
-            k32.ReadProcessMemory(hproc, ctypes.c_void_p(esp), stack, 16384, ctypes.byref(n))
+            size = STACK_MAX
+            while size >= 4096 and not k32.ReadProcessMemory(hproc, ctypes.c_void_p(esp), stack, size, ctypes.byref(n)):
+                size //= 2   # the read fails when it crosses the top of the committed stack
+            if size < 4096:
+                n.value = 0
             k32.ResumeThread(hthr)
             total += 1
             if base <= eip < base + dll_size:
@@ -150,6 +174,23 @@ def main():
                     incl[s] += 1
             else:
                 outside += 1
+                name = next((n for b, s, n in ranges if b <= eip < b + s), "?")
+                outside_by_module[name] += 1
+                if os.environ.get("PROF_DEBUG") and sum(outside_by_module.values()) in (50, 400, 900):
+                    ws = ctypes.cast(stack, ctypes.POINTER(ctypes.c_uint32))
+                    print(f"[debug] eip={eip:#x} esp={esp:#x} read={n.value} dll=[{base:#x},{base + dll_size:#x}) words:",
+                          " ".join(f"{ws[k]:08x}" for k in range(0, min(24, n.value // 4))))
+                # the nearest pawnc.dll frame on the stack = who called into the CRT / heap
+                words = ctypes.cast(stack, ctypes.POINTER(ctypes.c_uint32))
+                for i in range(n.value // 4):
+                    w = words[i]
+                    if base + 8 <= w < base + dll_size:
+                        caller = sym(w - 1)
+                        if tags.get(w - 1) == 5:
+                            outside_callers[(name, caller)] += 1
+                            break
+                else:
+                    outside_callers[(name, "(no pawnc frame found)")] += 1
         else:
             k32.ResumeThread(hthr)
         time.sleep(0.001)
@@ -157,6 +198,12 @@ def main():
     out = proc.stdout.read().decode("cp1251", "replace")
     print(f"samples={total} wall={wall:.1f}s outside-pawnc.dll={outside} ({outside * 100 / max(total, 1):.1f}%)")
     print(out.strip().splitlines()[-1] if out.strip() else "")
+    print("\n== OUTSIDE pawnc.dll, by module ==")
+    for name, c in outside_by_module.most_common(8):
+        print(f"{c * 100 / total:5.1f}%  {c:6d}  {name}")
+    print("\n== OUTSIDE samples by calling pawnc function (module / caller) ==")
+    for (mod, caller), c in outside_callers.most_common(16):
+        print(f"{c * 100 / total:5.1f}%  {c:6d}  {mod:12s} <- {caller}")
     print("\n== SELF (leaf) ==")
     for name, c in selfc.most_common(25):
         print(f"{c * 100 / total:5.1f}%  {c:6d}  {name}")

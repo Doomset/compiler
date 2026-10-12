@@ -703,12 +703,17 @@ static OPCODE opcodelist[] = {
 
 static int findopcode(char *instr,int maxlen)
 {
-  int low,high,mid,cmp;
+  int low,high,mid,cmp,k;
   char str[MAX_INSTR_LEN];
 
   if (maxlen>=MAX_INSTR_LEN)
     return 0;
   strlcpy(str,instr,maxlen+1);
+  /* the table is all lower case: fold the instruction once instead of comparing case-insensitively
+   * at every step of the search */
+  for (k=0; str[k]!='\0'; k++)
+    if (str[k]>='A' && str[k]<='Z')
+      str[k]=(char)(str[k]-'A'+'a');
   /* look up the instruction with a binary search
    * the assembler is case insensitive to instructions (but case sensitive
    * to symbols)
@@ -718,7 +723,7 @@ static int findopcode(char *instr,int maxlen)
   while (low<high) {
     mid=(low+high)/2;
     assert(opcodelist[mid].name!=NULL);
-    cmp=stricmp(str,opcodelist[mid].name);
+    cmp=strcmp(str,opcodelist[mid].name);
     if (cmp>0)
       low=mid+1;
     else
@@ -726,7 +731,7 @@ static int findopcode(char *instr,int maxlen)
   } /* while */
 
   assert(low==high);
-  if (stricmp(str,opcodelist[low].name)==0)
+  if (strcmp(str,opcodelist[low].name)==0)
     return low;         /* found */
   return 0;             /* not found, return special index */
 }

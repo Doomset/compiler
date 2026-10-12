@@ -132,6 +132,70 @@ SC_FUNC void clearstk(void)
   assert(stktop==0);
 }
 
+/* Include paths are searched for every #include in every directory and with up to five extensions, and a
+ * big gamemode includes the same files again and again: 89% of ~70,000 tries failed, each costing a stat() and
+ * a fopen(). A path that is not a readable file stays that way for the whole run, so it is remembered. The
+ * match is on the exact path string, so nothing is ever skipped that could have been found.
+ */
+static char **missing_tab=NULL;
+static size_t missing_cap=0,missing_cnt=0;
+
+static size_t missing_hash(const char *s)
+{
+  size_t h=5381;
+  while (*s!='\0')
+    h=h*33+(unsigned char)*s++;
+  return h;
+}
+
+static int path_is_missing(const char *path)
+{
+  size_t i;
+  if (missing_cnt==0)
+    return 0;
+  for (i=missing_hash(path)&(missing_cap-1); missing_tab[i]!=NULL; i=(i+1)&(missing_cap-1))
+    if (strcmp(missing_tab[i],path)==0)
+      return 1;
+  return 0;
+}
+
+static void path_set_missing(const char *path)
+{
+  size_t i;
+  char *copy;
+  if ((missing_cnt+1)*2>missing_cap) {
+    size_t newcap=(missing_cap==0) ? 4096 : missing_cap*2;
+    char **newtab=(char **)calloc(newcap,sizeof(char *));
+    size_t k;
+    if (newtab==NULL)
+      return;                   /* no cache; the search still works */
+    for (k=0; k<missing_cap; k++) {
+      if (missing_tab[k]!=NULL) {
+        for (i=missing_hash(missing_tab[k])&(newcap-1); newtab[i]!=NULL; i=(i+1)&(newcap-1))
+          /* nothing */;
+        newtab[i]=missing_tab[k];
+      } /* if */
+    } /* for */
+    free(missing_tab);
+    missing_tab=newtab;
+    missing_cap=newcap;
+  } /* if */
+  if ((copy=(char *)malloc(strlen(path)+1))==NULL)
+    return;
+  strcpy(copy,path);
+  for (i=missing_hash(path)&(missing_cap-1); missing_tab[i]!=NULL; i=(i+1)&(missing_cap-1))
+    /* nothing */;
+  missing_tab[i]=copy;
+  missing_cnt++;
+}
+
+#ifdef PERF_TRACE
+static unsigned long pf_calls=0,pf_tries=0,pf_found=0;
+static void pf_report(void)
+{
+  fprintf(stderr,"[perf] plungequalifiedfile: calls=%lu tries=%lu found=%lu failed_tries=%lu\n",pf_calls,pf_tries,pf_found,pf_tries-pf_found);
+}
+#endif
 SC_FUNC int plungequalifiedfile(char *name,char new_extensions)
 {
   unsigned int skipped_extensions = new_extensions ? 0 : 1;
@@ -144,6 +208,9 @@ SC_FUNC int plungequalifiedfile(char *name,char new_extensions)
   char *ext;
   unsigned int ext_idx;
 
+#ifdef PERF_TRACE
+  if (pf_calls++==0) atexit(pf_report);
+#endif
   fp=NULL;
   ext_idx=0;
   path=(char *)malloc(strlen(name)+sizeof(extensions[0]));
@@ -171,15 +238,26 @@ SC_FUNC int plungequalifiedfile(char *name,char new_extensions)
             *ptr=DIRSEP_CHAR;
       }
     #endif
-    stat(real_path, &st);
-    if (!S_ISDIR(st.st_mode))   /* ignore directories with the same name */
-      fp=(FILE*)pc_opensrc(real_path);
+#ifdef PERF_TRACE
+    pf_tries++;
+#endif
+    fp=NULL;
+    if (!path_is_missing(real_path)) {
+      /* a failing stat() means no such file: ignore directories with the same name */
+      if (stat(real_path, &st)==0 && !S_ISDIR(st.st_mode))
+        fp=(FILE*)pc_opensrc(real_path);
+      if (fp==NULL)
+        path_set_missing(real_path);
+    } /* if */
     if (fp==NULL) {
       *ext='\0';                /* on failure, restore filename */
       found=FALSE;
     } /* if */
     ext_idx++;
   } while (!found && ext_idx<arraysize(extensions)-skipped_extensions);
+#ifdef PERF_TRACE
+  if (found) pf_found++;
+#endif
   if (!found) {
     *ext='\0';                  /* restore filename */
     free(path);

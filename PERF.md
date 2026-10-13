@@ -223,6 +223,32 @@ Found on the way: the slots of `arginfo.dim`/`idxtag` past `numdim` are left uni
 compiler (the key writes zeros there); the second pass stores `__date`/`__time`/`__file` only if the
 first pass marked them used, so the usage of predefined symbols is part of the state.
 
+## Round 13: the include cache judges Cyrillic names and skips stat() for listed files
+
+`-D PERF_TRACE` on the gamemode after round 12: 2,405 `stat()` calls on missing paths were left, 2,388 of
+them Cyrillic file names (the listing compared ASCII only) and 17 names of directories; the 1,692 files
+that do exist each had a `stat()` before the `fopen()` as well. "miss+stat" was 0.275 s per compile.
+
+* A non-ASCII name is converted as the file API does (`AreFileApisANSI`) and looked up in a wide listing
+  of its directory (`FindFirstFileExW`, read on the first such name). Both sides are upper-cased by the
+  fixed case pairs of ASCII and U+0400..U+045F, which every NTFS upper-case table has; a name with any
+  other non-ASCII letter (in the query or in the directory) still goes to `stat()`.
+* A directory in the ANSI listing ends in '/', so a name that is a directory is answered "missing" (a
+  directory is no source file, as the `stat()` check said).
+* `dircache_lookup()` also answers "a file": a file of the listing is opened without `stat()`; names it
+  cannot judge (device names, roots, wildcards, short names...) keep the `stat()`.
+
+Trace: stat failures 2,405 -> 0, "miss+stat" 0.275 -> 0.076 s (760 listings, 125 of them wide, 0.054 s).
+The PGO build compiles the gamemode 6.90 -> 6.83 s (median of 4 alternating runs; a warm file cache
+answers `stat()` faster than the trace suggests). Checks: gamemode AMX identical to round 12 with
+`PAWNCC_FIXED_NOW`; `compare-tests` 0 mismatches; `pass-tests` all OK; `tools/include-tests/run.py`
+(new: ASCII and Cyrillic names in other letter case, Ё/ё, both separators, missing files and directories,
+a directory namesake, a directory with Greek and Latin-1 names, `-i` paths) gives the same messages and
+AMX as round 12.
+
+Found on the way: a Cyrillic file name without its extension (`#include "mod/ёлка"`) is not found in any
+version; the gamemode always writes `.inc`.
+
 ## Remaining profile (not done)
 
 `stgwrite`/`assemble` text handling (the code generator writes text, the assembler parses it back three times),

@@ -199,26 +199,35 @@ static unsigned srccache_hash(const char *s)
 }
 
 #ifdef PERF_TRACE
-static unsigned long sc_hits=0,sc_loads=0,sc_statfail=0,sc_dirmiss=0;
-static double sc_bytes=0,sc_t_stat=0,sc_t_open=0,sc_t_read=0,sc_t_xlat=0;
+static unsigned long sc_hits=0,sc_loads=0,sc_statfail=0,sc_dirmiss=0,sc_lists=0,sc_wlists=0,sc_listed=0;
+static double sc_bytes=0,sc_t_stat=0,sc_t_open=0,sc_t_read=0,sc_t_xlat=0,sc_t_list=0;
 static void srccache_report(void)
 {
   fprintf(stderr,"[perf] srccache: hits=%lu loads=%lu dir_miss=%lu stat_fail=%lu bytes=%.1f MB | miss+stat %.3f s, fopen %.3f s, read+close %.3f s, text xlat %.3f s\n",
           sc_hits,sc_loads,sc_dirmiss,sc_statfail,sc_bytes/1048576.0,sc_t_stat,sc_t_open,sc_t_read,sc_t_xlat);
+  fprintf(stderr,"[perf] dircache: %lu listings (%lu wide), %lu names, %.3f s\n",sc_lists,sc_wlists,sc_listed,sc_t_list);
 }
 #endif
 #if defined _WIN32
 /* Include search tries every include directory with every extension: ~14,000 paths that do not exist,
  * each a stat() of ~50 us. A directory is listed once instead; a name that is not in the listing of its
  * directory does not exist. Only a definite "missing" is answered here: names the listing cannot judge
- * exactly (non-ASCII, wildcards, 8.3 short names, streams, trailing dots or spaces, device names)
- * and directories that cannot be listed fall back to stat().
+ * exactly (wildcards, 8.3 short names, streams, trailing dots or spaces, device names, letters other than
+ * ASCII and basic Cyrillic) and directories that cannot be listed fall back to stat().
+ * ASCII names are looked up in the ANSI listing (a directory there ends in '/': it is no source file).
+ * A non-ASCII name is converted as the file API does (AreFileApisANSI) and looked up in a wide listing of
+ * the same directory, read on the first such name; both sides are upper-cased by the fixed case pairs of
+ * ASCII and U+0400..U+045F, which every NTFS upper-case table has. A directory that holds a file name with
+ * any other non-ASCII letter is not judged for non-ASCII names.
  */
 typedef struct tagDIRCACHE {
   struct tagDIRCACHE *next;
   int state;                    /* 1 listed, 0 the directory does not exist, -1 unknown (use stat) */
-  char **names;                 /* ASCII-lower-case names, sorted */
+  char **names;                 /* ASCII-lower-case names, sorted; a directory ends in '/' */
   size_t count;
+  int wstate;                   /* wide listing: 0 not read yet, 1 read, -1 cannot judge (use stat) */
+  WCHAR **wnames;               /* upper-cased file names (no directories), sorted */
+  size_t wcount;
   char dir[1];
 } DIRCACHE;
 #define DIRCACHE_BUCKETS 1024
@@ -257,6 +266,9 @@ static DIRCACHE *dircache_get(const char *dir,size_t dirlen)
   memcpy(d->dir,dir,dirlen);
   d->dir[dirlen]='\0';
   d->state=-1;
+#ifdef PERF_TRACE
+  { double t_list0=perf_now();
+#endif
   if ((pattern=(char *)malloc(dirlen+3))!=NULL) {
     if (dirlen==0) {
       strcpy(pattern,"*");
@@ -282,10 +294,16 @@ static DIRCACHE *dircache_get(const char *dir,size_t dirlen)
           } /* if */
           d->names=grown;
         } /* if */
-        if ((d->names[d->count]=_strdup(fd.cFileName))==NULL) {
-          d->state=-1;
-          break;
-        } /* if */
+        {
+          size_t len=strlen(fd.cFileName);
+          if ((d->names[d->count]=(char *)malloc(len+2))==NULL) {
+            d->state=-1;
+            break;
+          } /* if */
+          memcpy(d->names[d->count],fd.cFileName,len+1);
+          if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)!=0)
+            strcpy(d->names[d->count]+len,"/");   /* found by no source file name */
+        }
         ascii_lower(d->names[d->count]);
         d->count++;
       } while (FindNextFileA(hf,&fd));
@@ -297,46 +315,150 @@ static DIRCACHE *dircache_get(const char *dir,size_t dirlen)
     } /* if */
     free(pattern);
   } /* if */
+#ifdef PERF_TRACE
+  sc_lists++; sc_listed+=(unsigned long)d->count; sc_t_list+=perf_now()-t_list0; }
+  if (getenv("PAWNCC_TRACE_DIRLIST")!=NULL) fprintf(stderr,"[dirlist] %d %s\n",d->state,d->dir);
+#endif
   d->next=dircache[h];
   dircache[h]=d;
   return d;
 }
 
-/* TRUE only if "filename" certainly does not exist */
-static int dircache_missing(const char *filename)
+/* Upper-cases ASCII and basic Cyrillic (U+0400..U+045F) in place; FALSE if any other non-ASCII
+ * character is in the name. */
+static int wide_fold(WCHAR *s)
+{
+  for ( ; *s!=0; s++) {
+    if (*s<0x80) {
+      if (*s>='a' && *s<='z')
+        *s-='a'-'A';
+    } else if (*s>=0x0430 && *s<=0x044f) {
+      *s-=0x20;
+    } else if (*s>=0x0450 && *s<=0x045f) {
+      *s-=0x50;
+    } else if (*s<0x0400 || *s>0x042f) {
+      return FALSE;
+    } /* if */
+  } /* for */
+  return TRUE;
+}
+
+static int wdircache_cmp(const void *a,const void *b)
+{
+  return wcscmp(*(WCHAR * const *)a,*(WCHAR * const *)b);
+}
+
+static UINT fileapi_cp(void)
+{
+  return AreFileApisANSI() ? CP_ACP : CP_OEMCP;
+}
+
+/* The wide listing of a directory, read once; returns d->wstate */
+static int dircache_wlist(DIRCACHE *d)
+{
+  WCHAR pattern[_MAX_PATH+2];
+  WIN32_FIND_DATAW fd;
+  HANDLE hf;
+  size_t cap=0,len;
+  int n;
+
+  if (d->wstate!=0)
+    return d->wstate;
+#ifdef PERF_TRACE
+  sc_wlists++;
+#endif
+  d->wstate=-1;
+  if (d->dir[0]=='\0') {
+    wcscpy(pattern,L"*");
+  } else {
+    if ((n=MultiByteToWideChar(fileapi_cp(),MB_ERR_INVALID_CHARS,d->dir,-1,pattern,_MAX_PATH))==0)
+      return d->wstate;
+    wcscpy(pattern+n-1,L"\\*");
+  } /* if */
+  hf=FindFirstFileExW(pattern,FindExInfoBasic,&fd,FindExSearchNameMatch,NULL,FIND_FIRST_EX_LARGE_FETCH);
+  if (hf==INVALID_HANDLE_VALUE)
+    return d->wstate;
+  d->wstate=1;
+  do {
+    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)!=0)
+      continue;                 /* no source file */
+    if (!wide_fold(fd.cFileName)) {
+      d->wstate=-1;             /* a name this cache cannot compare: leave the directory to stat() */
+      break;
+    } /* if */
+    if (d->wcount==cap) {
+      WCHAR **grown;
+      cap=(cap==0) ? 64 : cap*2;
+      if ((grown=(WCHAR **)realloc(d->wnames,cap*sizeof(WCHAR *)))==NULL) {
+        d->wstate=-1;
+        break;
+      } /* if */
+      d->wnames=grown;
+    } /* if */
+    len=wcslen(fd.cFileName);
+    if ((d->wnames[d->wcount]=(WCHAR *)malloc((len+1)*sizeof(WCHAR)))==NULL) {
+      d->wstate=-1;
+      break;
+    } /* if */
+    memcpy(d->wnames[d->wcount],fd.cFileName,(len+1)*sizeof(WCHAR));
+    d->wcount++;
+  } while (FindNextFileW(hf,&fd));
+  if (d->wstate==1 && GetLastError()!=ERROR_NO_MORE_FILES)
+    d->wstate=-1;
+  FindClose(hf);
+  if (d->wstate==1)
+    qsort(d->wnames,d->wcount,sizeof(WCHAR *),wdircache_cmp);
+  return d->wstate;
+}
+
+/* -1 if "filename" certainly does not exist, 1 if its directory listing has it as a file,
+ * 0 if the listing cannot tell (stat() decides) */
+static int dircache_lookup(const char *filename)
 {
   const char *base,*p;
   char key[_MAX_PATH],*k;
   DIRCACHE *d;
+  int nonascii=FALSE;
 
   base=filename;
   for (p=filename; *p!='\0'; p++)
     if (*p=='\\' || *p=='/')
       base=p+1;
   if (*base=='\0' || strlen(base)>=sizeof key)
-    return FALSE;
-  for (p=base; *p!='\0'; p++)
-    if ((unsigned char)*p>=0x80 || *p=='*' || *p=='?' || *p=='~' || *p==':' || *p=='"' || *p=='<' || *p=='>' || *p=='|')
-      return FALSE;
+    return 0;
+  for (p=base; *p!='\0'; p++) {
+    if ((unsigned char)*p>=0x80)
+      nonascii=TRUE;
+    else if (*p=='*' || *p=='?' || *p=='~' || *p==':' || *p=='"' || *p=='<' || *p=='>' || *p=='|')
+      return 0;
+  } /* for */
   if (p[-1]=='.' || p[-1]==' ')
-    return FALSE;               /* Windows strips trailing dots and spaces */
+    return 0;               /* Windows strips trailing dots and spaces */
   strcpy(key,base);
   ascii_lower(key);
   for (k=key; *k!='\0' && *k!='.'; k++)
     /* nothing */;
   if (k-key==3 && (strncmp(key,"con",3)==0 || strncmp(key,"prn",3)==0 || strncmp(key,"aux",3)==0 || strncmp(key,"nul",3)==0))
-    return FALSE;               /* device names exist everywhere */
+    return 0;               /* device names exist everywhere */
   if (k-key==4 && (strncmp(key,"com",3)==0 || strncmp(key,"lpt",3)==0))
-    return FALSE;
+    return 0;
   if (base!=filename && (base==filename+1 || base[-2]==':' || base[-2]=='\\' || base[-2]=='/'))
-    return FALSE;               /* "\x", "C:\x", "a\\x": leave roots and doubled separators to stat() */
+    return 0;               /* "\x", "C:\x", "a\\x": leave roots and doubled separators to stat() */
   d=dircache_get(filename,(base==filename) ? 0 : (size_t)(base-filename-1));
   if (d==NULL || d->state<0)
-    return FALSE;
+    return 0;
   if (d->state==0)
-    return TRUE;
+    return -1;
+  if (nonascii) {
+    WCHAR wkey[_MAX_PATH],*wk=wkey;
+    if (MultiByteToWideChar(fileapi_cp(),MB_ERR_INVALID_CHARS,base,-1,wkey,_MAX_PATH)==0 || !wide_fold(wkey))
+      return 0;
+    if (dircache_wlist(d)!=1)
+      return 0;
+    return bsearch(&wk,d->wnames,d->wcount,sizeof(WCHAR *),wdircache_cmp)==NULL ? -1 : 1;
+  } /* if */
   k=key;
-  return bsearch(&k,d->names,d->count,sizeof(char *),dircache_cmp)==NULL;
+  return bsearch(&k,d->names,d->count,sizeof(char *),dircache_cmp)==NULL ? -1 : 1;
 }
 #endif
 
@@ -349,6 +471,7 @@ static SRCCACHE *srccache_load(const char *filename)
   long len;
   char *raw;
   size_t n,i,o;
+  int known=0;                  /* dircache_lookup(): 1 a listed file, 0 unknown */
 
 #ifdef PERF_TRACE
   static int reg=0;
@@ -366,7 +489,8 @@ static SRCCACHE *srccache_load(const char *filename)
   t0=perf_now();
 #endif
 #if defined _WIN32
-  if (dircache_missing(filename)) {
+  known=dircache_lookup(filename);
+  if (known<0) {
 #ifdef PERF_TRACE
     sc_dirmiss++;
     sc_t_stat+=perf_now()-t0;
@@ -374,7 +498,8 @@ static SRCCACHE *srccache_load(const char *filename)
     return NULL;
   } /* if */
 #endif
-  if (stat(filename,&st)!=0 || (st.st_mode & S_IFDIR)!=0) {
+  /* a file of a directory listing needs no stat() (~50 us); fopen() below still decides */
+  if (known==0 && (stat(filename,&st)!=0 || (st.st_mode & S_IFDIR)!=0)) {
 #ifdef PERF_TRACE
     if (getenv("PAWNCC_TRACE_STATFAIL")!=NULL) fprintf(stderr,"[statfail] %s\n",filename);
     sc_statfail++;

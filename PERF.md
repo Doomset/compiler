@@ -12,7 +12,8 @@ Machine: Xeon E5-2690 v3 @ 2.6 GHz, Windows 10, MSVC 2022 (Win32, Release, `sNAM
 | + round 2 (`8582b56`) | 30.2 s | identical |
 | + round 3 (`79d1535`) | **22.1 s** | identical |
 | + rounds 4-5 (`2cff1a0`, `48e9904`) and two `forward`s in the gamemode | 13.2 s | identical |
-| + round 6 | **12.0 s** | identical |
+| + round 6 | 12.0 s | identical |
+| + LTCG + PGO build (round 7, same sources) | **10.0 s** | identical |
 
 "Identical" means byte for byte except the compile time string that Pawn embeds (`tools/compare_amx.py`
 reports it as a time string). `ctest` gives the same result as the unmodified build: 90 of 93 tests pass,
@@ -58,6 +59,23 @@ pawncc is single-threaded (98% of one core for the whole run), so the profile is
    first pass (~6 s) when a function with a tag is called before it is defined and has no prototype. Two
    `forward` declarations in the gamemode remove it; the generated program differs from the 2-pass build by one
    padding cell and the data addresses it shifts (checked cell by cell).
+
+## Round 7: whole-program and profile-guided build, 12.39 s -> 10.04 s
+
+No source change: `tools/build-pgo.cmd` builds with `/GL` + `/LTCG` and Profile-Guided Optimization.
+Median of 5 alternating runs each: round 6 12.39 s, LTCG alone 11.47 s (-7%), LTCG + PGO 10.04 s (-19%).
+AMX identical, `ctest` the same 90/93, the PGO `pawnc.dll` imports the same DLLs (no `pgort140.dll`).
+
+Rebuilding it (the profile belongs to the exact objects, so retrain after any source change):
+
+1. `tools\build-pgo.cmd build-pgo gen` - instrumented `pawnc.dll` plus `pawnc.pgd`.
+2. Compile the real gamemode once with `build-pgo\pawncc.exe` (same arguments as a normal build), with
+   `...\VC\Tools\MSVC\<ver>\bin\Hostx86\x86` (it holds `pgort140.dll`) on `PATH`. It runs ~4x slower and
+   leaves `pawnc!1.pgc` next to the DLL.
+3. `tools\build-pgo.cmd build-pgo use` - relinks with the profile (`pawnc.pgd` grows when it is merged).
+
+A file's cold paths can only get slower under PGO, never wrong: other scripts compile correctly, just with
+less of the gain.
 
 ## Phase breakdown (round 5 build, `-D PERF_TRACE`)
 

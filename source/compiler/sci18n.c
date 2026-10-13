@@ -393,11 +393,21 @@ SC_FUNC int scan_utf8(FILE *fp,const char *filename)
   #if defined NO_UTF8
     return 0;
   #else
-    void *resetpos=pc_getpossrc(fp);
+    void *resetpos=pc_getpossrc(fp);  /* also when the answer is known: it sets the position that
+                                       * pc_getpossrc() hands out (one static for all files) */
     int utf8=TRUE;
     int firstchar=TRUE,bom_found=FALSE;
     const unsigned char *ptr;
 
+    if (pc_srcutf8_get(fp,&utf8,&bom_found)) {
+      if (bom_found) {
+        unsigned char bom[3];
+        if (!utf8)
+          error(77,filename);   /* malformed UTF-8 encoding */
+        pc_readsrc(fp,bom,3);
+      } /* if */
+      return utf8;
+    } /* if */
     while (utf8 && pc_readsrc(fp,pline,sLINEMAX)!=NULL) {
       ptr=pline;
       if (firstchar) {
@@ -413,6 +423,7 @@ SC_FUNC int scan_utf8(FILE *fp,const char *filename)
         utf8= (get_utf8_char(ptr,&ptr)>=0);
     } /* while */
     pc_resetsrc(fp,resetpos);
+    pc_srcutf8_set(fp,utf8,bom_found);
     if (bom_found) {
       unsigned char bom[3];
       if (!utf8)

@@ -15,7 +15,8 @@ Machine: Xeon E5-2690 v3 @ 2.6 GHz, Windows 10, MSVC 2022 (Win32, Release, `sNAM
 | + round 6 | 12.0 s | identical |
 | + LTCG + PGO build (round 7, same sources) | 10.0 s | identical |
 | + round 8 (initializer fast path), LTCG + PGO | 8.9 s | identical |
-| + round 9 (macro table and substitution), LTCG + PGO | **7.7 s** | identical |
+| + round 9 (macro table and substitution), LTCG + PGO | 7.7 s | identical |
+| + round 10 (assembler operands, data fill, UTF-8 scan cache), LTCG + PGO | **7.5 s** | identical |
 
 "Identical" means byte for byte except the compile time string that Pawn embeds (`tools/compare_amx.py`
 reports it as a time string). `ctest` gives the same result as the unmodified build: 90 of 93 tests pass,
@@ -61,6 +62,29 @@ pawncc is single-threaded (98% of one core for the whole run), so the profile is
    first pass (~6 s) when a function with a tag is called before it is defined and has no prototype. Two
    `forward` declarations in the gamemode remove it; the generated program differs from the 2-pass build by one
    padding cell and the data addresses it shifts (checked cell by cell).
+
+## Round 10: assembler and source scanning, 7.83 s -> 7.48 s (both LTCG + PGO; 9.28 s -> 8.59 s without PGO)
+
+* `write_encoded_n()` (the `dumpn` of zero-filled arrays: 181 MB of data, ~45 million one-byte cells under
+  compact encoding) called `pc_writebin()` once per cell; the copies are now gathered in a 4 KB block.
+* The assembler's first pass already parsed every operand to compute code sizes. It now keeps the parsed
+  operands (a value, or a label number resolved through `lbltab[]` when written), and the code and data
+  passes write them without seeking, copying and parsing the text again. Function names are resolved in the
+  first pass, which runs the `code` directives (current file for static functions) in the same order as the
+  code pass; `data` directives still only take effect in the data pass. Cells are written one by one through
+  `write_encoded()` as before, so the compact-encoding overflow check and its restart behave the same.
+  Assembler 1.74 s -> 1.21 s (trace build).
+* `scan_utf8()` read every included file completely (to classify it as UTF-8 or not) on every `#include` in
+  both passes: ~39 MB per pass, one `get_utf8_char()` per byte. The answer depends only on the bytes from the
+  start of the file, so it is kept with the cached file; `pc_getpossrc()` is still called, since it sets the
+  one static position that the compiler hands out.
+
+Checks: gamemode AMX identical; `ctest` 90/93; `tools/compare-tests` identical, with new scripts for the data
+fill (zero and value fills above one 4 KB block, multi-byte encodings), the compact-encoding restart
+(warning 232) and source encodings (UTF-8 without BOM, CP1251, BOM, malformed UTF-8 after a BOM); the fill,
+float, macro and restart scripts also with `-C-` (no compact encoding).
+Found on the way, unchanged: the BOM is skipped with `pc_readsrc(fp,bom,3)`, which reads only two bytes
+(fgets semantics), so a file with a UTF-8 BOM fails with error 010 on the stock compiler too.
 
 ## Round 9: macro lookup and substitution, 8.55 s -> 7.72 s (both LTCG + PGO)
 

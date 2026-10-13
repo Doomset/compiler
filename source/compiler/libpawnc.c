@@ -171,19 +171,22 @@ int pc_error(int number,char *message,char *filename,int firstline,int lastline,
  * and scan_utf8() read the same bytes, and fgets() on a FILE* (lock, per-line CRT work) was ~10% of a compile.
  * Semantics follow a text-mode fopen(): "\r\n" becomes "\n" and ^Z ends the data.
  */
+typedef struct tagSRCCACHE {
+  struct tagSRCCACHE *next;
+  char *data;
+  size_t size;
+  int utf8;                     /* result of scan_utf8() from the start of the file: -1 not scanned yet */
+  int bom;                      /* ... and whether the file starts with a UTF-8 byte order mark */
+  char name[1];
+} SRCCACHE;
+
 typedef struct tagSRCFILE {
   FILE *fp;                     /* write handle (pc_createsrc/pc_createtmpsrc), NULL for a read handle */
   const char *data;
   size_t size,pos;
   int eof;                      /* set like feof(): only after a read ran into the end of the data */
+  SRCCACHE *cache;              /* the cached file of a read handle */
 } SRCFILE;
-
-typedef struct tagSRCCACHE {
-  struct tagSRCCACHE *next;
-  char *data;
-  size_t size;
-  char name[1];
-} SRCCACHE;
 #define SRCCACHE_BUCKETS 4096
 static SRCCACHE *srccache[SRCCACHE_BUCKETS];
 
@@ -419,6 +422,8 @@ static SRCCACHE *srccache_load(const char *filename)
   strcpy(e->name,filename);
   e->data=raw;
   e->size=o;
+  e->utf8=-1;
+  e->bom=0;
   e->next=srccache[h];
   srccache[h]=e;
   return e;
@@ -433,7 +438,29 @@ void *pc_opensrc(char *filename)
     return NULL;
   f->data=e->data;
   f->size=e->size;
+  f->cache=e;
   return f;
+}
+
+/* scan_utf8() reads a whole file to classify it, on every #include of it in every pass; the answer depends
+ * only on the bytes from the start of the file, which the cache keeps unchanged, so it is kept with them */
+int pc_srcutf8_get(void *handle,int *utf8,int *bom)
+{
+  SRCFILE *f=(SRCFILE *)handle;
+  if (f==NULL || f->cache==NULL || f->pos!=0 || f->cache->utf8<0)
+    return 0;
+  *utf8=f->cache->utf8;
+  *bom=f->cache->bom;
+  return 1;
+}
+
+void pc_srcutf8_set(void *handle,int utf8,int bom)
+{
+  SRCFILE *f=(SRCFILE *)handle;
+  if (f!=NULL && f->cache!=NULL && f->pos==0) {
+    f->cache->utf8=utf8 ? 1 : 0;
+    f->cache->bom=bom ? 1 : 0;
+  } /* if */
 }
 
 /* pc_createsrc()

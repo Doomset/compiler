@@ -300,6 +300,25 @@ static void write_encoded(FILE *fbin,ucell *c,int num)
   } /* while */
 }
 
+/* writes "num" copies of "len" bytes; a large zero-filled array is millions of cells of one byte each, so
+ * the copies are gathered in a buffer and written in large blocks (the same bytes as one write per copy) */
+static void write_repeated(FILE *fbin,const unsigned char *bytes,int len,int num)
+{
+  unsigned char chunk[4096];
+  int per,fill,i;
+
+  assert(len>0 && len<=(int)sizeof chunk);
+  per=(int)sizeof chunk/len;          /* copies per block */
+  fill=(num<per) ? num : per;
+  for (i=0; i<fill; i++)
+    memcpy(chunk+i*len,bytes,len);
+  while (num>0) {
+    int n=(num<per) ? num : per;
+    writeerror |= !pc_writebin(fbin,chunk,n*len);
+    num-=n;
+  } /* while */
+}
+
 static void write_encoded_n(FILE *fbin,ucell c,int num)
 {
   int len;
@@ -314,14 +333,13 @@ static void write_encoded_n(FILE *fbin,ucell c,int num)
     assert_static(AMX_COMPACTMARGIN>2);
     if (bytes_out-bytes_in>=AMX_COMPACTMARGIN-2)
       longjmp(compact_err,1);
-    while (num-->0)
-      writeerror |= !pc_writebin(fbin,bytes,len);
+    if (num>0)
+      write_repeated(fbin,bytes,len,num);
   } else {
     (void)aligncell(&c);
-    while (num-->0) {
-      assert((pc_lengthbin(fbin) % sizeof(cell)) == 0);
-      writeerror |= !pc_writebin(fbin,&c,sizeof c);
-    } /* while */
+    assert(num<=0 || (pc_lengthbin(fbin) % sizeof(cell)) == 0);
+    if (num>0)
+      write_repeated(fbin,(const unsigned char *)&c,(int)sizeof c,num);
   } /* if */
 }
 
@@ -758,6 +776,196 @@ static long *rec_off=NULL;              /* offset of the line in the intermediat
 static unsigned short *rec_op=NULL;     /* ... and its index in opcodelist */
 static size_t rec_num=0,rec_cap=0;
 
+/* The first pass also keeps the parsed operands of every instruction, so that the code and data passes write
+ * them without reading and parsing the text again. An operand is a value, or a label number that is looked
+ * up in lbltab[] when it is written. Function names are resolved in the first pass: those lookups depend on
+ * the current file ("code" lines, which the first pass executes in the same order as the code pass) and on
+ * function addresses, which no longer change. */
+static size_t *rec_arg=NULL;            /* first operand of each record in opval[]/opkind[] */
+static ucell *opval=NULL;
+static unsigned char *opkind=NULL;      /* 0 value, 1 label number */
+static size_t opnum=0,opcap=0;
+
+static void op_push(ucell value,unsigned char kind)
+{
+  if (opnum==opcap) {
+    size_t newcap=(opcap==0) ? 262144 : opcap*2;
+    ucell *newval=(ucell *)realloc(opval,newcap*sizeof *opval);
+    unsigned char *newkind;
+    if (newval!=NULL)
+      opval=newval;
+    newkind=(unsigned char *)realloc(opkind,newcap*sizeof *opkind);
+    if (newkind!=NULL)
+      opkind=newkind;
+    if (newval==NULL || newkind==NULL)
+      error(103);               /* insufficient memory */
+    opcap=newcap;
+  } /* if */
+  opval[opnum]=value;
+  opkind[opnum]=kind;
+  opnum++;
+}
+
+/* getparam() that keeps a label as its number (lbltab[] is not complete in the first pass) */
+static void capture_param(const char *s,char **n)
+{
+  int i;
+  ucell result=0;
+  char name[sNAMEMAX+1];
+  symbol *sym;
+
+  if (s[0]=='.') {
+    for (i=0; !isspace(*(++s)); i++) {
+      assert(*s!='\0');
+      assert(i<sNAMEMAX);
+      name[i]=*s;
+    } /* for */
+    name[i]='\0';
+    sym=findglb(name,sGLOBAL);
+    assert(sym!=NULL);
+    assert(sym->ident==iFUNCTN || sym->ident==iREFFUNC);
+    assert(sym->vclass==sGLOBAL);
+    op_push((ucell)sym->addr,0);
+  } else if (s[0]=='l' && s[1]=='.') {
+    i=(int)hex2long(s+2,NULL);
+    assert(i>=0 && i<sc_labnum);
+    op_push((ucell)i,1);        /* like getparam(), "s" stays at the label */
+  } else {
+    for ( ;; ) {
+      result+=hex2long(s,(char**)&s);
+      if (*s!='+')
+        break;
+      s++;
+    } /* for */
+    op_push(result,0);
+  } /* if */
+  if (n!=NULL)
+    *n=(char*)s;
+}
+
+static int parm_count(OPCODE_PROC func)
+{
+  if (func==parm0) return 0;
+  if (func==parm1) return 1;
+  if (func==parm2) return 2;
+  if (func==parm3) return 3;
+  if (func==parm4) return 4;
+  if (func==parm5) return 5;
+  return -1;
+}
+
+/* first pass: parse the operands of instruction "i" into the pool and return its code size; it has the same
+ * side effects as the handler called with fbin==NULL (for code segment instructions) */
+static cell capture_instr(int i,char *params)
+{
+  OPCODE_PROC func=opcodelist[i].func;
+  int n=parm_count(func),k;
+
+  if (n>=0) {
+    for (k=0; k<n; k++)
+      capture_param(params,&params);
+    return opcodes(1)+opargs(n);
+  } else if (func==do_jump) {
+    k=(int)hex2long(params,NULL);
+    assert(k>=0 && k<sc_labnum);
+    op_push((ucell)k,1);
+    return opcodes(1)+opargs(1);
+  } else if (func==do_call) {
+    char name[sNAMEMAX+2];
+    symbol *sym;
+    for (k=0; !isspace(*params); k++,params++) {
+      assert(*params!='\0');
+      assert(k<sNAMEMAX+1);
+      name[k]=*params;
+    } /* for */
+    name[k]='\0';
+    if (name[0]=='l' && name[1]=='.') {
+      k=(int)hex2long(name+2,NULL);
+      assert(k>=0 && k<sc_labnum);
+      op_push((ucell)k,1);
+    } else {
+      assert(name[0]=='.');
+      sym=findglb(name+1,sGLOBAL);
+      assert(sym!=NULL);
+      assert(sym->ident==iFUNCTN || sym->ident==iREFFUNC);
+      assert(sym->vclass==sGLOBAL);
+      op_push((ucell)sym->addr,0);
+    } /* if */
+    return opcodes(1)+opargs(1);
+  } else if (func==do_case) {
+    ucell v=hex2long(params,&params);
+    k=(int)hex2long(params,NULL);
+    assert(k>=0 && k<sc_labnum);
+    op_push(v,0);
+    op_push((ucell)k,1);
+    return opcodes(0)+opargs(2);
+  } else if (func==do_dump) {
+    size_t countpos=opnum;
+    int num=0;
+    op_push(0,0);               /* number of values, filled in below */
+    while (*params!='\0') {
+      op_push(hex2long(params,&params),0);
+      num++;
+      while (isspace(*params))
+        params++;
+    } /* while */
+    opval[countpos]=(ucell)num;
+    return num*sizeof(cell);
+  } else if (func==do_dumpn) {
+    ucell value=hex2long(params,&params);
+    int num=(int)hex2long(params,NULL);
+    op_push(value,0);
+    op_push((ucell)num,0);
+    return num*sizeof(cell);
+  } else if (func==set_currentfile) {
+    ucell v=getparam(params,NULL);
+    op_push(v,0);
+    if (opcodelist[i].segment==sIN_CSEG)
+      fcurrent=(short)v;        /* the first pass runs the code segment directives */
+    return 0;
+  } /* if */
+  assert(func==noop);
+  return 0;
+}
+
+/* code and data passes: write the instruction from its recorded operands, like its handler does */
+static void replay_instr(FILE *fout,int i,size_t a)
+{
+  OPCODE_PROC func=opcodelist[i].func;
+  cell opcode=opcodelist[i].opcode;
+  int n=parm_count(func),k;
+  ucell v;
+
+  if (n>=0) {
+    write_encoded(fout,(ucell*)&opcode,1);
+    for (k=0; k<n; k++,a++) {
+      v=(opkind[a]!=0) ? (ucell)lbltab[opval[a]] : opval[a];
+      write_encoded(fout,&v,1);
+    } /* for */
+  } else if (func==do_jump || func==do_call) {
+    write_encoded(fout,(ucell*)&opcode,1);
+    v=(opkind[a]!=0) ? (ucell)lbltab[opval[a]] : opval[a];
+    write_encoded(fout,&v,1);
+  } else if (func==do_case) {
+    v=opval[a];
+    write_encoded(fout,&v,1);
+    v=(ucell)lbltab[opval[a+1]];
+    write_encoded(fout,&v,1);
+  } else if (func==do_dump) {
+    int num=(int)opval[a++];
+    for (k=0; k<num; k++,a++) {
+      v=opval[a];
+      write_encoded(fout,&v,1);
+    } /* for */
+  } else if (func==do_dumpn) {
+    write_encoded_n(fout,opval[a],(int)opval[a+1]);
+  } else if (func==set_currentfile) {
+    fcurrent=(short)opval[a];
+  } else {
+    assert(func==noop);
+  } /* if */
+}
+
 SC_FUNC int assemble(FILE *fout,FILE *fin)
 {
   AMX_HEADER hdr;
@@ -787,6 +995,7 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
     error(232);           /* disabled compact encoding */
   } /* if */
   rec_num=0;
+  opnum=0;
 
   #if !defined NDEBUG
     /* verify that the opcode list is sorted (skip entry 1; it is reserved
@@ -1103,18 +1312,26 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
           unsigned short *newop;
           if (newoff!=NULL)
             rec_off=newoff;
+          size_t *newarg;
           newop=(unsigned short *)realloc(rec_op,newcap*sizeof *rec_op);
           if (newop!=NULL)
             rec_op=newop;
-          if (newoff==NULL || newop==NULL)
+          newarg=(size_t *)realloc(rec_arg,newcap*sizeof *rec_arg);
+          if (newarg!=NULL)
+            rec_arg=newarg;
+          if (newoff==NULL || newop==NULL || newarg==NULL)
             error(103);         /* insufficient memory */
           rec_cap=newcap;
         } /* if */
         rec_off[rec_num]=thispos;
         rec_op[rec_num]=(unsigned short)i;
+        rec_arg[rec_num]=opnum;
         rec_num++;
-        if (opcodelist[i].segment==sIN_CSEG)
-          codeindex+=opcodelist[i].func(NULL,skipwhitespace(params),opcodelist[i].opcode);
+        {
+          cell size=capture_instr(i,skipwhitespace(params));
+          if (opcodelist[i].segment==sIN_CSEG)
+            codeindex+=size;
+        }
       } /* if */
     } /* while */
   } /* if */
@@ -1127,19 +1344,12 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
   bytes_out=0;
   for (pass=sIN_CSEG; pass<=sIN_DSEG; pass++) {
     if (lbltab!=NULL) {
-      /* the first pass recorded every instruction line: no need to lex the whole file again for each segment */
+      /* the first pass recorded every instruction with its parsed operands: write them, no text is read again */
       for (k=0; k<rec_num; k++) {
         i=rec_op[k];
         if (opcodelist[i].segment!=pass)
           continue;
-        pc_seekasm(fin,rec_off[k]);
-        if (pc_readasm(fin,line,sizeof line)==NULL)
-          break;
-        stripcomment(line);
-        instr=skipwhitespace(line);
-        for (params=instr; *params!='\0' && !isspace(*params); params++)
-          /* nothing */;
-        opcodelist[i].func(fout,skipwhitespace(params),opcodelist[i].opcode);
+        replay_instr(fout,i,rec_arg[k]);
       } /* for */
 #ifdef PERF_TRACE
       perf_pass(pass==sIN_CSEG ? "asm: code segment" : "asm: data segment");

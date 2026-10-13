@@ -981,6 +981,8 @@ SC_FUNC int cp_set(const char *name);
 SC_FUNC cell cp_translate(const unsigned char *string,const unsigned char **endptr);
 SC_FUNC cell get_utf8_char(const unsigned char *string,const unsigned char **endptr);
 SC_FUNC int scan_utf8(FILE *fp,const char *filename);
+int pc_srcutf8_get(void *handle,int *utf8,int *bom);
+void pc_srcutf8_set(void *handle,int utf8,int bom);
 
 /* function prototypes in SCSTATE.C */
 SC_FUNC constvalue *automaton_add(const char *name);

@@ -3036,6 +3036,19 @@ static cell init(int ident,int *tag,int *errorfound)
 {
   cell i = 0;
 
+  if (lex_initconst(&i,tag)) {
+    /* a plain "[-]number": the same staging and error bracket as constexpr(), without the parser */
+    int index;
+    cell cidx;
+    stgset(TRUE);
+    stgget(&index,&cidx);
+    errorset(sEXPRMARK,0);
+    stgdel(index,cidx);
+    stgset(FALSE);
+    errorset(sEXPRRELEASE,0);
+    litadd(i);
+    return i;
+  } /* if */
   if (matchtoken(tSTRING)){
     /* lex() automatically stores strings in the literal table (and
      * increases "litidx")

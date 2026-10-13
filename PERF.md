@@ -13,7 +13,8 @@ Machine: Xeon E5-2690 v3 @ 2.6 GHz, Windows 10, MSVC 2022 (Win32, Release, `sNAM
 | + round 3 (`79d1535`) | **22.1 s** | identical |
 | + rounds 4-5 (`2cff1a0`, `48e9904`) and two `forward`s in the gamemode | 13.2 s | identical |
 | + round 6 | 12.0 s | identical |
-| + LTCG + PGO build (round 7, same sources) | **10.0 s** | identical |
+| + LTCG + PGO build (round 7, same sources) | 10.0 s | identical |
+| + round 8 (initializer fast path), LTCG + PGO | **8.9 s** | identical |
 
 "Identical" means byte for byte except the compile time string that Pawn embeds (`tools/compare_amx.py`
 reports it as a time string). `ctest` gives the same result as the unmodified build: 90 of 93 tests pass,
@@ -59,6 +60,28 @@ pawncc is single-threaded (98% of one core for the whole run), so the profile is
    first pass (~6 s) when a function with a tag is called before it is defined and has no prototype. Two
    `forward` declarations in the gamemode remove it; the generated program differs from the 2-pass build by one
    padding cell and the data addresses it shifts (checked cell by cell).
+
+## Round 8: array initializers without the expression parser, 9.81 s -> 8.86 s (both LTCG + PGO)
+
+A time-per-source-file profile (`PAWNCC_FILE_PROFILE=<file.tsv>` with the `-D PERF_TRACE` build: the time from
+one source line to the next goes to the file of that line) showed one 14 MB file of animation tables,
+`new const Float:x[401][31][7] = {{{0.1480000,-0.0334300,...}}}`, taking 1.97 s of 11 s: ~1.4 million
+literals, each parsed in both passes by `constexpr()` -> `expression()` -> `hier14()` ... `hier2()` -> `primary()`
+(an operator test at every level, `ldconst` code that `stgdel` throws away). Data files like it were ~20%.
+
+`init()` now first asks `lex_initconst()`: `initvector()` has already read the element's first token and pushed
+it back; when that token is a number followed by `,` or `}`, or `-` followed by a number and then `,` or `}`
+(on the same line), the element is taken directly. The value is what `hier2()`/`constant()` compute (a negated
+integer, or a negated `float` for a rational); the same `stgset`/`stgget`/`stgdel`/`errorset` bracket as
+`constexpr()` runs; the lexer is left as after lexing the number. Anything else (expressions, symbols, tags,
+strings, a value continued on the next line, fixed-point mode where `ftoi()` can warn, documentation or
+recording mode) consumes nothing and goes the old way.
+
+That file alone: 1.46 s -> 0.53 s. Without PGO the gain on the whole gamemode is ~2 s; with PGO 0.95 s
+(PGO had already sped up the general path). Checks: gamemode AMX identical; `ctest` 90/93 as before; five
+test scripts (negative/hex/binary/char literals, `- 0.5`, `-0.0`, `-7.25e2`, expressions, `...`, enum fields
+with braces, strings, tag overrides, trailing commas, values split across lines, fixed point, no rational
+support, syntax errors such as `--2`, `-`, `1 2`, `-1.0.5`, `-1x`) give the same messages and the same AMX.
 
 ## Round 7: whole-program and profile-guided build, 12.39 s -> 10.04 s
 

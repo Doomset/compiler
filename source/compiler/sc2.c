@@ -2079,6 +2079,96 @@ static void substallpatterns(unsigned char *line,int buffersize)
  *                     pline    (altered)
  *                     freading (referred to only)
  */
+#ifdef PERF_TRACE
+/* PAWNCC_FILE_PROFILE=<path>: time per source file. The time from one source line to the next (directives,
+ * macro substitution, parsing and code generation of that line) goes to the file the line came from. */
+typedef struct { char *name; double t[2]; unsigned long lines[2]; } FILEPROF;
+static FILEPROF *fp_tab=NULL;
+static int *fp_slot=NULL;
+static int fp_cap=0,fp_cnt=0,fp_cur=-1,fp_on=-1;
+static const char *fp_out=NULL,*fp_lastptr=NULL;
+static double fp_last=0;
+
+static unsigned fp_hash(const char *s)
+{
+  unsigned h=5381;
+  while (*s!='\0')
+    h=h*33u+(unsigned char)*s++;
+  return h;
+}
+
+static void fp_rehash(int cap)
+{
+  int i,j;
+  free(fp_slot);
+  fp_slot=(int *)malloc(cap*sizeof(int));
+  for (i=0; i<cap; i++)
+    fp_slot[i]=-1;
+  for (i=0; i<fp_cnt; i++) {
+    for (j=fp_hash(fp_tab[i].name)&(cap-1); fp_slot[j]>=0; j=(j+1)&(cap-1))
+      /* nothing */;
+    fp_slot[j]=i;
+  } /* for */
+  fp_cap=cap;
+}
+
+static int fp_intern(const char *name)
+{
+  int j;
+  if (fp_cnt*2>=fp_cap) {
+    fp_tab=(FILEPROF *)realloc(fp_tab,(fp_cap==0 ? 1024 : fp_cap)*sizeof(FILEPROF));
+    fp_rehash(fp_cap==0 ? 2048 : fp_cap*2);
+  } /* if */
+  for (j=fp_hash(name)&(fp_cap-1); fp_slot[j]>=0; j=(j+1)&(fp_cap-1))
+    if (strcmp(fp_tab[fp_slot[j]].name,name)==0)
+      return fp_slot[j];
+  memset(&fp_tab[fp_cnt],0,sizeof(FILEPROF));
+  fp_tab[fp_cnt].name=duplicatestring(name);
+  fp_slot[j]=fp_cnt;
+  return fp_cnt++;
+}
+
+static void fp_report(void)
+{
+  FILE *f=fopen(fp_out,"w");
+  int i;
+  if (f==NULL)
+    return;
+  fprintf(f,"file\tpass1_s\tpass2_s\tlines1\tlines2\n");
+  for (i=0; i<fp_cnt; i++)
+    fprintf(f,"%s\t%.6f\t%.6f\t%lu\t%lu\n",fp_tab[i].name,fp_tab[i].t[0],fp_tab[i].t[1],
+            fp_tab[i].lines[0],fp_tab[i].lines[1]);
+  fclose(f);
+}
+
+static void fp_tick(void)
+{
+  double now;
+  if (fp_on<0) {
+    fp_out=getenv("PAWNCC_FILE_PROFILE");
+    fp_on=(fp_out!=NULL);
+    if (fp_on)
+      atexit(fp_report);
+  } /* if */
+  if (!fp_on)
+    return;
+  now=perf_now();
+  if (fp_cur>=0)
+    fp_tab[fp_cur].t[sc_status==statFIRST ? 0 : 1]+=now-fp_last;
+  fp_last=now;
+}
+
+static void fp_mark(void)
+{
+  if (!fp_on || inpfname==NULL)
+    return;
+  if (inpfname!=fp_lastptr || fp_cur<0 || strcmp(fp_tab[fp_cur].name,inpfname)!=0)
+    fp_cur=fp_intern(inpfname);
+  fp_lastptr=inpfname;
+  fp_tab[fp_cur].lines[sc_status==statFIRST ? 0 : 1]++;
+}
+#endif
+
 SC_FUNC void preprocess(void)
 {
   int iscommand;
@@ -2093,7 +2183,13 @@ SC_FUNC void preprocess(void)
   if (depth++==0) t0=perf_now();
 #endif
   do {
+#ifdef PERF_TRACE
+    fp_tick();
+#endif
     readline(pline);
+#ifdef PERF_TRACE
+    fp_mark();
+#endif
     /* ??? no need for this when reading back from list file (in the second pass) */
     if (stripcomment(pline)==0) {
     lptr=pline;           /* set "line pointer" to start of the parsing buffer */
@@ -2680,6 +2776,80 @@ SC_FUNC void lexpush(void)
 {
   assert(_pushed==FALSE);
   _pushed=TRUE;
+}
+
+/*  lex_initconst
+ *
+ *  Fast path for one array initializer (14 MB of animation tables are ~1.4 million of them): a literal
+ *  "number" or "-number" followed by "," or "}" on the same line. initvector() has already read the
+ *  first token of the element and pushed it back. On success the element is consumed exactly as the
+ *  expression parser would leave it (the lexer stands behind the number) and its value and tag are
+ *  returned; otherwise nothing is consumed and the caller parses the expression as before.
+ *  The value equals what hier2() and constant() compute: a negated integer, or a negated "float" bit
+ *  pattern for a rational number (only with "#pragma rational" in floating point mode, where ftoi()
+ *  raises no errors).
+ */
+SC_FUNC int lex_initconst(cell *val,int *tag)
+{
+  const unsigned char *p,*q;
+  cell v;
+  int len,rational,skipped;
+
+  if (!_pushed || !freading || pc_docexpr || pc_isrecording)
+    return FALSE;
+  if (_lextok==tNUMBER || _lextok==tRATIONAL) {
+    rational=(_lextok==tRATIONAL);
+    if (rational && sc_rationaltag==0)
+      return FALSE;
+    for (q=lptr; *q<=' ' && *q!='\0'; q++)
+      /* nothing */;
+    if (*q!=',' && *q!='}')
+      return FALSE;
+    v=_lexval;
+    _pushed=FALSE;      /* the number is consumed; lptr already stands behind it */
+  } else if (_lextok=='-') {
+    for (p=lptr; *p<=' ' && *p!='\0'; p++)
+      /* nothing */;
+    if (!isdigit(*p))
+      return FALSE;
+    if ((len=number(&v,p))!=0) {
+      rational=FALSE;
+    } else if (sc_rationaltag!=0 && rational_digits==0 && (len=ftoi(&v,p))!=0) {
+      rational=TRUE;
+    } else {
+      return FALSE;
+    } /* if */
+    for (q=p+len; *q<=' ' && *q!='\0'; q++)
+      /* nothing */;
+    if (*q!=',' && *q!='}')
+      return FALSE;
+    /* consume "-" and the number; leave the lexer as lex() leaves it after the number */
+    skipped=(p!=lptr);
+    _pushed=FALSE;
+    lptr=p+len;
+    _lextok=rational ? tRATIONAL : tNUMBER;
+    _lexval=v;
+    _lexstr[0]='\0';
+    _lexnewline=FALSE;
+    iskipwspace=skipped;
+    if (rational) {
+      #if PAWN_CELL_SIZE==32
+        float *f=(float *)&v;
+      #elif PAWN_CELL_SIZE==64
+        double *f=(double *)&v;
+      #else
+        #error Unsupported cell size
+      #endif
+      *f= - *f;
+    } else {
+      v=-v;
+    } /* if */
+  } else {
+    return FALSE;
+  } /* if */
+  *val=v;
+  *tag=rational ? sc_rationaltag : 0;
+  return TRUE;
 }
 
 /*  lexclr

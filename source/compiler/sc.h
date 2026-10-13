@@ -770,6 +770,7 @@ SC_FUNC void preprocess(void);
 SC_FUNC void lexinit(void);
 SC_FUNC int lex(cell *lexvalue,char **lexsym);
 SC_FUNC void lexpush(void);
+SC_FUNC int lex_initconst(cell *val,int *tag);
 SC_FUNC void lexclr(int clreol);
 SC_FUNC void recstart(void);
 SC_FUNC void recstop(void);

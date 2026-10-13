@@ -3738,12 +3738,25 @@ SC_FUNC void rename_symbol(symbol *sym,const char *newname)
     symbol_cache_add(sym);
 }
 
+#ifdef PERF_TRACE
+static unsigned long long fs_calls[2],fs_steps[2];
+static void fs_report(void)
+{
+  fprintf(stderr,"[perf] find_symbol: local calls=%llu steps=%llu | global calls=%llu steps=%llu\n",
+          fs_calls[0],fs_steps[0],fs_calls[1],fs_steps[1]);
+}
+#endif
 static symbol *find_symbol(const symbol *root,const char *name,int fnumber,int automaton,int *cmptag)
 {
   symbol *firstmatch=NULL;
   symbol *sym=root->next;
   int count=0;
   const int is_global=(root==&glbtab);
+#ifdef PERF_TRACE
+  static int fs_reg=0;
+  if (!fs_reg) { fs_reg=1; atexit(fs_report); }
+  fs_calls[is_global]++;
+#endif
 
   if (is_global) {
     symbol **pcache_sym=(symbol **)hashtable_find(&symbol_cache_ht,namehash(name));
@@ -3751,6 +3764,9 @@ static symbol *find_symbol(const symbol *root,const char *name,int fnumber,int a
   } /* if */
 
   while (sym!=NULL) {
+#ifdef PERF_TRACE
+    fs_steps[is_global]++;
+#endif
     if ( (is_global || strcmp(name,sym->name)==0)           /* check name */
         && (sym->parent==NULL || sym->ident==iCONSTEXPR)    /* sub-types (hierarchical types) are skipped, except for enum fields */
         && (sym->fnumber<0 || sym->fnumber==fnumber))       /* check file number for scope */

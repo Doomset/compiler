@@ -46,6 +46,35 @@
 #include "../amx/osdefs.h"
 #include "../amx/amx.h"
 
+#if defined _MSC_VER
+  /* The MSVC CRT character tests are out-of-line calls into ucrtbase.dll (~5% of a large compile).
+   * The compiler never calls setlocale(), so in the "C" locale these ASCII versions return the same
+   * values as the CRT for every char (signed or unsigned) and EOF.
+   */
+  #include <ctype.h>
+  static __inline int sc_isdigit(int c) { return (unsigned)(c-'0')<10u; }
+  static __inline int sc_isalpha(int c) { return (unsigned)((c|0x20)-'a')<26u; }
+  static __inline int sc_isspace(int c) { return c==' ' || (unsigned)(c-'\t')<5u; }
+  static __inline int sc_isupper(int c) { return (unsigned)(c-'A')<26u; }
+  static __inline int sc_isalnum(int c) { return sc_isdigit(c) || sc_isalpha(c); }
+  static __inline int sc_tolower(int c) { return sc_isupper(c) ? c+('a'-'A') : c; }
+  static __inline int sc_toupper(int c) { return (unsigned)(c-'a')<26u ? c-('a'-'A') : c; }
+  #undef isdigit
+  #undef isalpha
+  #undef isspace
+  #undef isupper
+  #undef isalnum
+  #undef tolower
+  #undef toupper
+  #define isdigit(c)  sc_isdigit(c)
+  #define isalpha(c)  sc_isalpha(c)
+  #define isspace(c)  sc_isspace(c)
+  #define isupper(c)  sc_isupper(c)
+  #define isalnum(c)  sc_isalnum(c)
+  #define tolower(c)  sc_tolower(c)
+  #define toupper(c)  sc_toupper(c)
+#endif
+
 /* Note: the "cell" and "ucell" types are defined in AMX.H */
 
 #define PUBLIC_CHAR '@'     /* character that defines a function "public" */

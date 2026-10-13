@@ -11,6 +11,8 @@ Machine: Xeon E5-2690 v3 @ 2.6 GHz, Windows 10, MSVC 2022 (Win32, Release, `sNAM
 | + round 1 (`a9d0e62`) | ~35 s | identical |
 | + round 2 (`8582b56`) | 30.2 s | identical |
 | + round 3 (`79d1535`) | **22.1 s** | identical |
+| + rounds 4-5 (`2cff1a0`, `48e9904`) and two `forward`s in the gamemode | 13.2 s | identical |
+| + round 6 | **12.0 s** | identical |
 
 "Identical" means byte for byte except the compile time string that Pawn embeds (`tools/compare_amx.py`
 reports it as a time string). `ctest` gives the same result as the unmodified build: 90 of 93 tests pass,
@@ -94,9 +96,22 @@ Self time plus the CRT/ntdll samples attributed to their pawnc caller, grouped:
 missing paths take 0.7 s (the missing-path cache is per exact string; every include dir x extension x name
 misses once). Under an antivirus scan `srccache_load` waits much longer (18% of a loaded run's samples).
 
-Cheap next steps, single-threaded: answer missing paths from a per-directory listing instead of `stat`;
-in `lex`, test for a digit once before `number()`/`ftoi()` (every identifier goes through both, and `ftoi`
-builds `dbase` before its own `isdigit` test); CRT `isdigit`/`tolower` in the hot loops.
+## Round 6: 13.21 s -> 11.99 s (median of 5 alternating runs each)
+
+* Missing include paths are answered from a per-directory listing (`FindFirstFileExA`, once per directory,
+  ASCII-case-folded and sorted) instead of a `stat()` each: 11,945 of the 14,342 failing `stat` calls go.
+  Only a definite "missing" is answered; names the listing cannot judge exactly (non-ASCII, wildcards, `~`
+  short names, `:` streams, trailing dots or spaces, device names, roots, doubled separators) and
+  directories that cannot be listed still go to `stat()`. The 2,397 left are Cyrillic file names.
+* `lex` tests for a digit once before `number()`/`ftoi()`; all of their parsers return 0 otherwise, and
+  every symbol went through both.
+* `isdigit`/`isalpha`/`isspace`/`isupper`/`isalnum`/`tolower`/`toupper` are ASCII inline functions under
+  MSVC (`sc.h`). The compiler never calls `setlocale()`; in the "C" locale they match the CRT for every value
+  from -128 to 255 (checked by a test program against ucrtbase).
+
+Checks: gamemode AMX identical to round 5 apart from the time string; `ctest` the same 90/93; an include
+test (other letter case, `/` and `\`, `#tryinclude` into a missing directory, a missing file) gives the
+same messages and the same AMX on both builds.
 
 ## Remaining profile (not done)
 

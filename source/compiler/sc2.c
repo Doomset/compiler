@@ -2528,11 +2528,12 @@ SC_FUNC int lex(cell *lexvalue,char **lexsym)
   } /* if (index) */
 
   starttoken=lptr;      /* save start pointer (for concatenating to documentation string) */
-  if ((i=number(&_lexval,lptr))!=0) {   /* number */
+  /* number() and ftoi() return 0 unless the token starts with a digit: skip both for symbols */
+  if (isdigit(*lptr) && (i=number(&_lexval,lptr))!=0) {   /* number */
     _lextok=tNUMBER;
     *lexvalue=_lexval;
     lptr+=i;
-  } else if ((i=ftoi(&_lexval,lptr))!=0) {
+  } else if (isdigit(*lptr) && (i=ftoi(&_lexval,lptr))!=0) {
     _lextok=tRATIONAL;
     *lexvalue=_lexval;
     lptr+=i;

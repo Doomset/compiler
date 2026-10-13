@@ -302,13 +302,16 @@ static void adjustindex(char c)
   substindex[(int)c-PUBLIC_CHAR]=cur;
 }
 
-/* Almost every identifier the compiler reads is not a macro, and finding that out meant walking the whole
- * bucket of its first character. Every (length, prefix) key that was ever inserted is kept in a hash set
- * (entries are never removed, so a deleted macro only costs a normal search); a key that is not in the set
- * is certainly not in the list.
+/* Macro prefixes are unique: "#define" of a prefix that exists deletes the old macro first. So a hash table
+ * from (prefix, length) to the list node answers find_subst() with one probe, where the list search walked
+ * every macro with the same first character (most identifiers are not macros at all, and YSI has 20,000+
+ * macros). The sorted list stays as it was, for insertion and deletion. If the table cannot be allocated,
+ * find_subst() falls back to the list search for the rest of the run.
  */
-static unsigned long long *subst_keys=NULL;
-static size_t subst_key_cap=0,subst_key_cnt=0;
+typedef struct { unsigned long long key; stringpair *item; } SUBSTSLOT;
+static SUBSTSLOT *subst_map=NULL;
+static size_t subst_map_cap=0,subst_map_cnt=0;
+static int subst_map_off=FALSE;
 
 static unsigned long long subst_key(const char *s,int len)
 {
@@ -323,51 +326,94 @@ static unsigned long long subst_key(const char *s,int len)
   return h|1ULL;                /* 0 marks an empty slot */
 }
 
-static void subst_key_add(const char *s,int len)
+#define SUBST_HOME(key,cap)   ((size_t)((key)>>7)&((cap)-1))
+
+static void subst_map_drop(void)
 {
-  unsigned long long key=subst_key(s,len);
-  size_t i;
-  if ((subst_key_cnt+1)*2>subst_key_cap) {
-    size_t newcap=(subst_key_cap==0) ? 8192 : subst_key_cap*2;
-    unsigned long long *newkeys=(unsigned long long *)calloc(newcap,sizeof(unsigned long long));
-    size_t k;
-    if (newkeys==NULL) {
-      /* no memory for the set: drop it, find_subst() then always does the normal search */
-      free(subst_keys);
-      subst_keys=NULL;
-      subst_key_cap=subst_key_cnt=0;
-      return;
-    } /* if */
-    for (k=0; k<subst_key_cap; k++) {
-      if (subst_keys[k]!=0) {
-        for (i=(size_t)(subst_keys[k]>>7)&(newcap-1); newkeys[i]!=0; i=(i+1)&(newcap-1))
-          /* nothing */;
-        newkeys[i]=subst_keys[k];
-      } /* if */
-    } /* for */
-    free(subst_keys);
-    subst_keys=newkeys;
-    subst_key_cap=newcap;
-  } /* if */
-  for (i=(size_t)(key>>7)&(subst_key_cap-1); subst_keys[i]!=0; i=(i+1)&(subst_key_cap-1))
-    if (subst_keys[i]==key)
-      return;
-  subst_keys[i]=key;
-  subst_key_cnt++;
+  free(subst_map);
+  subst_map=NULL;
+  subst_map_cap=subst_map_cnt=0;
 }
 
-/* FALSE only when no macro with this length and prefix was inserted since the table was cleared */
-static int subst_key_may_exist(const char *s,int len)
+static void subst_map_put(stringpair *item)
 {
   unsigned long long key;
   size_t i;
-  if (subst_keys==NULL)
-    return TRUE;                /* set not available (or no macros yet): do the normal search */
-  key=subst_key(s,len);
-  for (i=(size_t)(key>>7)&(subst_key_cap-1); subst_keys[i]!=0; i=(i+1)&(subst_key_cap-1))
-    if (subst_keys[i]==key)
-      return TRUE;
-  return FALSE;
+  if (subst_map_off)
+    return;
+  if ((subst_map_cnt+1)*2>subst_map_cap) {
+    size_t newcap=(subst_map_cap==0) ? 8192 : subst_map_cap*2;
+    SUBSTSLOT *newmap=(SUBSTSLOT *)calloc(newcap,sizeof(SUBSTSLOT));
+    size_t k;
+    if (newmap==NULL) {
+      subst_map_drop();
+      subst_map_off=TRUE;       /* find_subst() searches the list from now on */
+      return;
+    } /* if */
+    for (k=0; k<subst_map_cap; k++) {
+      if (subst_map[k].key!=0) {
+        for (i=SUBST_HOME(subst_map[k].key,newcap); newmap[i].key!=0; i=(i+1)&(newcap-1))
+          /* nothing */;
+        newmap[i]=subst_map[k];
+      } /* if */
+    } /* for */
+    free(subst_map);
+    subst_map=newmap;
+    subst_map_cap=newcap;
+  } /* if */
+  key=subst_key(item->first,item->matchlength);
+  for (i=SUBST_HOME(key,subst_map_cap); subst_map[i].key!=0; i=(i+1)&(subst_map_cap-1))
+    /* nothing */;
+  subst_map[i].key=key;
+  subst_map[i].item=item;
+  subst_map_cnt++;
+}
+
+static stringpair *subst_map_get(const char *name,int length)
+{
+  unsigned long long key=subst_key(name,length);
+  size_t i;
+  for (i=SUBST_HOME(key,subst_map_cap); subst_map[i].key!=0; i=(i+1)&(subst_map_cap-1)) {
+    stringpair *item=subst_map[i].item;
+    if (subst_map[i].key==key && item->matchlength==length && strncmp(item->first,name,length)==0)
+      return item;
+  } /* for */
+  return NULL;
+}
+
+static void subst_map_remove(stringpair *item)
+{
+  unsigned long long key;
+  size_t i,j,k,mask;
+  if (subst_map==NULL)
+    return;
+  mask=subst_map_cap-1;
+  key=subst_key(item->first,item->matchlength);
+  for (i=SUBST_HOME(key,subst_map_cap); subst_map[i].key!=0 && subst_map[i].item!=item; i=(i+1)&mask)
+    /* nothing */;
+  if (subst_map[i].key==0)
+    return;
+  /* linear probing: delete by shifting later entries of the cluster back */
+  subst_map[i].key=0;
+  subst_map[i].item=NULL;
+  subst_map_cnt--;
+  for (j=(i+1)&mask; subst_map[j].key!=0; j=(j+1)&mask) {
+    k=SUBST_HOME(subst_map[j].key,subst_map_cap);
+    if ((i<=j) ? (i<k && k<=j) : (i<k || k<=j))
+      continue;                 /* its home lies between the hole and itself: it stays */
+    subst_map[i]=subst_map[j];
+    subst_map[j].key=0;
+    subst_map[j].item=NULL;
+    i=j;
+  } /* for */
+}
+
+static stringpair *subst_list_find(char *name,int length)
+{
+  stringpair *item=substindex[(int)*name-PUBLIC_CHAR];
+  if (item!=NULL)
+    item=find_stringpair(item,name,length);
+  return item;
 }
 
 SC_FUNC stringpair *insert_subst(char *pattern,char *substitution,int prefixlen)
@@ -378,23 +424,21 @@ SC_FUNC stringpair *insert_subst(char *pattern,char *substitution,int prefixlen)
   assert(substitution!=NULL);
   if ((cur=insert_stringpair_from(&substpair,subst_before(*pattern),pattern,substitution,prefixlen))==NULL)
     error(103);       /* insufficient memory (fatal error) */
-  subst_key_add(pattern,prefixlen);
+  subst_map_put(cur);
   adjustindex(*pattern);
   return cur;
 }
 
 SC_FUNC stringpair *find_subst(char *name,int length)
 {
-  stringpair *item;
   assert(name!=NULL);
   assert(length>0);
   assert(*name>='A' && *name<='Z' || *name>='a' && *name<='z' || *name=='_' || *name==PUBLIC_CHAR);
-  if (!subst_key_may_exist(name,length))
-    return NULL;
-  item=substindex[(int)*name-PUBLIC_CHAR];
-  if (item!=NULL)
-    item=find_stringpair(item,name,length);
-  return item;
+  if (subst_map_off)
+    return subst_list_find(name,length);
+  if (subst_map==NULL)
+    return NULL;                /* no macros */
+  return subst_map_get(name,length);
 }
 
 SC_FUNC int delete_subst(char *name,int length)
@@ -403,11 +447,10 @@ SC_FUNC int delete_subst(char *name,int length)
   assert(name!=NULL);
   assert(length>0);
   assert(*name>='A' && *name<='Z' || *name>='a' && *name<='z' || *name=='_' || *name==PUBLIC_CHAR);
-  item=substindex[(int)*name-PUBLIC_CHAR];
-  if (item!=NULL)
-    item=find_stringpair(item,name,length);
+  item=find_subst(name,length);
   if (item==NULL)
     return FALSE;
+  subst_map_remove(item);
   delete_stringpair_from(&substpair,subst_before(*name),item);
   adjustindex(*name);
   return TRUE;
@@ -419,9 +462,8 @@ SC_FUNC void delete_substtable(void)
   delete_stringpairtable(&substpair);
   for (i=0; i<arraysize(substindex); i++)
     substindex[i]=NULL;
-  free(subst_keys);
-  subst_keys=NULL;
-  subst_key_cap=subst_key_cnt=0;
+  subst_map_drop();
+  subst_map_off=FALSE;
 }
 
 #endif /* !defined NO_SUBST */

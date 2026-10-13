@@ -14,7 +14,8 @@ Machine: Xeon E5-2690 v3 @ 2.6 GHz, Windows 10, MSVC 2022 (Win32, Release, `sNAM
 | + rounds 4-5 (`2cff1a0`, `48e9904`) and two `forward`s in the gamemode | 13.2 s | identical |
 | + round 6 | 12.0 s | identical |
 | + LTCG + PGO build (round 7, same sources) | 10.0 s | identical |
-| + round 8 (initializer fast path), LTCG + PGO | **8.9 s** | identical |
+| + round 8 (initializer fast path), LTCG + PGO | 8.9 s | identical |
+| + round 9 (macro table and substitution), LTCG + PGO | **7.7 s** | identical |
 
 "Identical" means byte for byte except the compile time string that Pawn embeds (`tools/compare_amx.py`
 reports it as a time string). `ctest` gives the same result as the unmodified build: 90 of 93 tests pass,
@@ -60,6 +61,23 @@ pawncc is single-threaded (98% of one core for the whole run), so the profile is
    first pass (~6 s) when a function with a tag is called before it is defined and has no prototype. Two
    `forward` declarations in the gamemode remove it; the generated program differs from the 2-pass build by one
    padding cell and the data addresses it shifts (checked cell by cell).
+
+## Round 9: macro lookup and substitution, 8.55 s -> 7.72 s (both LTCG + PGO)
+
+After round 8 the macro engine was the largest single block (~15%: `find_stringpair` 5.2%, `substpattern` ~7%).
+
+* `find_subst()`: a macro prefix is unique (`#define` of an existing prefix deletes the old macro first), so a
+  hash table from (prefix, length) to the list node replaces the "may exist" key set; a real macro use no
+  longer walks every macro with the same first character. Deletion removes the entry by backward shift
+  (linear probing). If the table cannot be allocated, the list search is used for the rest of the run.
+* `substpattern()`: the expansion was inserted one character at a time (`strins(s,e,1)`), each moving the
+  whole rest of the line. It is now built once (its length was already computed for the overflow check),
+  then the tail is moved once. Warning 236 comes in the same order.
+
+Non-PGO 10.06 s -> 9.35 s; with PGO 8.55 s -> 7.72 s. Gamemode AMX identical, `ctest` 90/93, and
+`tools/compare-tests` (now also `macros.pwn`: define/undef/redefinition with warning 201, `#if defined`,
+parameters, chains; `macros_subst.pwn`: long and nested expansions, `%0` inside a string; `macros_236.pwn`)
+identical.
 
 ## Round 8: array initializers without the expression parser, 9.81 s -> 8.86 s (both LTCG + PGO)
 

@@ -1974,29 +1974,40 @@ static int substpattern(unsigned char *line,size_t buffersize,char *pattern,char
     if (strlen((char*)line) + len - (int)(s-line) > buffersize) {
       error(75);      /* line too long */
     } else {
-      /* substitute pattern */
+      /* substitute pattern: build the expansion ("len" bytes, counted above) once, then move the rest of the
+       * line a single time (inserting it character by character moved the rest of the line per character)
+       */
+      unsigned char *expansion=(unsigned char*)malloc(len+1);
+      unsigned char *o;
+      size_t taillen;
+      if (expansion==NULL)
+        error(103);     /* insufficient memory */
       instring=0;
-      strdel((char*)line,(int)(s-line));
-      for (e=(unsigned char*)substitution,s=line; *e!='\0'; e++) {
+      for (e=(unsigned char*)substitution,o=expansion; *e!='\0'; e++) {
         if (*e=='%' && isdigit(*(e+1)) && !instring) {
           arg=*(e+1)-'0';
           assert(arg>=0 && arg<=9);
           if (args[arg]!=NULL) {
-            strins((char*)s,(char*)args[arg],strlen((char*)args[arg]));
-            s+=strlen((char*)args[arg]);
+            size_t arglen=strlen((char*)args[arg]);
+            memcpy(o,args[arg],arglen);
+            o+=arglen;
           } else {
             error(236); /* parameter does not exist, incorrect #define pattern */
-            strins((char*)s,(char*)e,2);
-            s+=2;
+            memcpy(o,e,2);
+            o+=2;
           } /* if */
           e++;          /* skip %, digit is skipped later */
         } else {
           if (*e=='"')
             instring=!instring;
-          strins((char*)s,(char*)e,1);
-          s++;
+          *o++=*e;
         } /* if */
       } /* for */
+      assert((int)(o-expansion)==len);
+      taillen=strlen((char*)s);
+      memmove(line+len,s,taillen+1);  /* the rest of the line, behind the expansion */
+      memcpy(line,expansion,len);
+      free(expansion);
     } /* if */
   } /* if */
 

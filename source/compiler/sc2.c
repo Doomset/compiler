@@ -546,6 +546,20 @@ static void readline(unsigned char *line)
  *  was no explicit line continuation, merely an implicit string one.
  *
  */
+/* Characters with no meaning to stripcomment() outside comments, strings and the raw-string directives:
+ * a run of them only clears "rawmode" (every character but '!' does). */
+static unsigned char strip_plain[256];
+static int strip_plain_ready=0;
+
+static void strip_plain_init(void)
+{
+  int i;
+  for (i=0; i<256; i++)
+    strip_plain[i]=1;
+  strip_plain[0]=strip_plain['/']=strip_plain['\\']=strip_plain['"']=strip_plain['\'']=strip_plain['!']=0;
+  strip_plain_ready=1;
+}
+
 static int stripcomment(unsigned char *line)
 {
   char c;
@@ -587,7 +601,24 @@ static int stripcomment(unsigned char *line)
     }
   }
 
+  if (!strip_plain_ready)
+    strip_plain_init();
   while (*line) {
+    if (icomment==1 && *line!='*' && *line!='/') {
+      /* inside a plain comment: everything up to a '*' or '/' becomes a space */
+      do {
+        *line++=' ';
+      } while (*line!='\0' && *line!='*' && *line!='/');
+      continue;
+    } /* if */
+    if (icomment==0 && incommand==0 && strip_plain[*line]) {
+      /* a run of plain characters: each would only reset rawmode and move on */
+      do {
+        line++;
+      } while (strip_plain[*line]);
+      rawmode=0;
+      continue;
+    } /* if */
     if (icomment!=0) {
       if (*line=='*' && *(line+1)=='/') {
         #if !defined SC_LIGHT

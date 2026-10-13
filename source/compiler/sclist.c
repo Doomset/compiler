@@ -572,6 +572,11 @@ SC_FUNC int popfront_heaplist(long *first, long *second)
   return 1;
 }
 
+SC_FUNC valuepair *heaplist_first(void)
+{
+  return heaplist.next;
+}
+
 SC_FUNC void delete_heaplisttable(void)
 {
   valuepair *cur;

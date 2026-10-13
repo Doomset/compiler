@@ -196,6 +196,33 @@ Checks: gamemode AMX identical to round 5 apart from the time string; `ctest` th
 test (other letter case, `/` and `\`, `#tryinclude` into a missing directory, a missing file) gives the
 same messages and the same AMX on both builds.
 
+## Round 12: speculative second pass (scpass.c)
+
+The second pass depends only on the state the first pass leaves: the global symbol table (usage flags,
+tags, prototypes, array sizes), the tag, library, automaton, state and state-combination tables, the
+heap list and the settings a #pragma changes. `PAWNCC_PASS_SAVE=<file>` writes that state where the
+second pass starts; `PAWNCC_PASS_LOAD=<file>` skips the first pass and starts from a saved state.
+
+A build runs both at once (MODS ZONA `tools/pawn_build.py`): a normal compile that saves the new
+state, and a second pass from the previous build's state. Besides the state, the save writes
+`<file>.key`, the state without what the second pass sets again before reading it: declaration line
+numbers, code addresses, function and global variable addresses (a variable cannot be used before
+its declaration, error 017, also in `#emit` and `sizeof`; calls go through labels), stack sizes,
+referrer lists, `__line`, `__timestamp` and the data address of the string constants. Equal keys,
+equal second passes: the build takes the speculative AMX if its compile printed no message (message
+positions are not part of the key) and stops the normal one.
+
+Gamemode (PGO build): normal compile 7.1 s, second pass from a state 4.65 s. An edit inside function
+bodies keeps the key (number, text, added lines, a new branch; 14 random edits across the gamemode:
+14 hits, AMX byte-identical to a normal compile each time). A new global symbol changes it and the
+build waits for the normal compile. `PAWNCC_FIXED_NOW=<unix time>` fixes `__timestamp`/`__date`/
+`__time` for reproducible output. Tests: `tools/pass-tests/run.py`; why a build missed:
+`tools/pass_key_diff.py`. `PAWNCC_PASS_DEBUG=1` prints the progress of a load.
+
+Found on the way: the slots of `arginfo.dim`/`idxtag` past `numdim` are left uninitialized by the
+compiler (the key writes zeros there); the second pass stores `__date`/`__time`/`__file` only if the
+first pass marked them used, so the usage of predefined symbols is part of the state.
+
 ## Remaining profile (not done)
 
 `stgwrite`/`assemble` text handling (the code generator writes text, the assembler parses it back three times),

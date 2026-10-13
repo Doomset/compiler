@@ -90,6 +90,7 @@ set(PAWNC_SRCS
   sci18n.c
   sclist.c
   scmemfil.c
+  scpass.c
   scstate.c
   scvars.c
   version.h)

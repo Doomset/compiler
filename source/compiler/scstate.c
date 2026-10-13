@@ -256,6 +256,41 @@ SC_FUNC int state_addlist(int *list,int count,int fsa)
   return ptr->listid;
 }
 
+/* scpass.c: the combinations table in table order (index 0 is the head) */
+SC_FUNC int state_list_get(int index,const int **states,int *numstates,int *fsa,int *listid)
+{
+  statelist *ptr;
+  for (ptr=statelist_tab.next; ptr!=NULL && index>0; ptr=ptr->next)
+    index--;
+  if (ptr==NULL)
+    return FALSE;
+  *states=ptr->states;
+  *numstates=ptr->numstates;
+  *fsa=ptr->fsa;
+  *listid=ptr->listid;
+  return TRUE;
+}
+
+/* scpass.c: appends at the tail, so that a table read with state_list_get() comes back in order */
+SC_FUNC void state_list_append(const int *states,int numstates,int fsa,int listid)
+{
+  statelist *ptr,*last;
+  if ((ptr=(statelist*)malloc(sizeof(statelist)))==NULL)
+    error(103);         /* insufficient memory */
+  if ((ptr->states=(int*)malloc(((numstates>0) ? numstates : 1)*sizeof(int)))==NULL) {
+    free(ptr);
+    error(103);         /* insufficient memory */
+  } /* if */
+  memcpy(ptr->states,states,numstates*sizeof(int));
+  ptr->numstates=numstates;
+  ptr->fsa=fsa;
+  ptr->listid=listid;
+  ptr->next=NULL;
+  for (last=&statelist_tab; last->next!=NULL; last=last->next)
+    /* nothing */;
+  last->next=ptr;
+}
+
 SC_FUNC void state_deletetable(void)
 {
   statelist *ptr;

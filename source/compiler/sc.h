@@ -953,6 +953,13 @@ SC_FUNC void delete_autolisttable(void);
 SC_FUNC valuepair *push_heaplist(long first, long second);
 SC_FUNC int popfront_heaplist(long *first, long *second);
 SC_FUNC void delete_heaplisttable(void);
+SC_FUNC valuepair *heaplist_first(void);
+
+/* function prototypes in SCPASS.C */
+SC_FUNC int pass_state_save(const char *path);
+SC_FUNC int pass_state_load(const char *path);
+SC_FUNC int state_list_get(int index,const int **states,int *numstates,int *fsa,int *listid);
+SC_FUNC void state_list_append(const int *states,int numstates,int fsa,int listid);
 SC_FUNC stringlist *insert_dbgfile(const char *filename);
 SC_FUNC stringlist *insert_dbgline(int linenr);
 SC_FUNC stringlist *insert_dbgsymbol(symbol *sym);

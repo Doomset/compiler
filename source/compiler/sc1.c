@@ -584,6 +584,7 @@ int pc_compile(int argc, char *argv[])
   FILE *binf;
   void *inpfmark;
   int lcl_packstr,lcl_needsemicolon,lcl_tabsize;
+  char *pass_load=NULL,*pass_save=NULL;   /* scpass.c */
   #if !defined SC_LIGHT
     int hdrsize=0;
   #endif
@@ -696,7 +697,19 @@ int pc_compile(int argc, char *argv[])
   /* do the first pass through the file (or possibly two or more "first passes") */
   sc_parsenum=0;
   inpfmark=pc_getpossrc(inpf_org);
-  do {
+  /* PAWNCC_PASS_LOAD: start the second pass from the state a previous compile saved with
+   * PAWNCC_PASS_SAVE instead of running the first pass (scpass.c) */
+  pass_load=getenv("PAWNCC_PASS_LOAD");
+  pass_save=getenv("PAWNCC_PASS_SAVE");
+  if (sc_makereport || sc_listing) {
+    pass_load=NULL;       /* the report and the listing come from the first pass */
+    pass_save=NULL;
+  } /* if */
+  if (pass_load!=NULL && *pass_load=='\0')
+    pass_load=NULL;
+  if (pass_save!=NULL && *pass_save=='\0')
+    pass_save=NULL;
+  if (pass_load==NULL) do {
     /* reset "defined" flag of all functions and global variables */
     reduce_referrers(&glbtab);
     delete_symbols(&glbtab,0,TRUE,FALSE);
@@ -742,7 +755,8 @@ int pc_compile(int argc, char *argv[])
     sc_status=statSECOND;
   else
     sc_status=statWRITE;                  /* set, to enable warnings */
-  state_conflict(&glbtab);
+  if (pass_load==NULL)
+    state_conflict(&glbtab);
 
   /* write a report, if requested */
   #if !defined SC_LIGHT
@@ -792,13 +806,28 @@ int pc_compile(int argc, char *argv[])
    */
 
   /* reset "defined" flag of all functions and global variables */
-  reduce_referrers(&glbtab);
-  delete_symbols(&glbtab,0,TRUE,FALSE);
+  if (pass_load==NULL) {
+    reduce_referrers(&glbtab);
+    delete_symbols(&glbtab,0,TRUE,FALSE);
+  } /* if */
   #if !defined NO_DEFINE
     delete_substtable();
   #endif
   resetglobals();
   errorset(sRESET,0);
+  if (pass_load!=NULL) {
+    if (!pass_state_load(pass_load)) {
+      pc_printf("[pass] cannot load %s\n",pass_load);
+      errnum++;
+      goto cleanup;
+    } /* if */
+  } else if (pass_save!=NULL) {
+    if (!pass_state_save(pass_save))
+      pc_printf("[pass] state not saved to %s\n",pass_save);
+  } /* if */
+#ifdef PERF_TRACE
+  perf_pass("pass state load/save");
+#endif
   /* reset the source file */
   inpf=inpf_org;
   freading=TRUE;
@@ -1752,6 +1781,8 @@ static void setconstants(void)
   add_builtin_constant("__compat",pc_compat,sGLOBAL,0);
 
   now=time(NULL);
+  if (getenv("PAWNCC_FIXED_NOW")!=NULL)   /* reproducible builds and the tests of scpass.c */
+    now=(time_t)strtoll(getenv("PAWNCC_FIXED_NOW"),NULL,10);
   loctm=*localtime(&now);
   utctm=*gmtime(&now);
   loctime=now+(loctm.tm_sec-utctm.tm_sec)+(loctm.tm_min-utctm.tm_min)*60

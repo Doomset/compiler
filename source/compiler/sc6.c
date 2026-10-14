@@ -966,6 +966,434 @@ static void replay_instr(FILE *fout,int i,size_t a)
   } /* if */
 }
 
+
+/* Round 14: the label pass in parallel.
+ *
+ * The label pass reads every line of the intermediate file (4.5 million for a large gamemode) and was the
+ * longest single-threaded step of the assembler. The file is in memory: it is cut after a '\n' into chunks
+ * that threads parse into chunk-local records, operands and labels, exactly like the loop of the serial pass
+ * (lines are taken in the same pieces as mfgets(), at most sizeof line-1 characters). The merge then appends
+ * the chunks in order: label addresses get the code size of the chunks before them, and the two things the
+ * serial pass did in file order are done here in file order as well -- "code" file directives (fcurrent) and
+ * the lookup of function names, which depends on fcurrent. Anything the serial pass would report or assert
+ * on (an unknown instruction, a label number out of range, an unknown function) drops the parallel result and
+ * the serial pass runs, as before. PAWNCC_ASM_THREADS=n sets the number of chunks (1: serial; by default half the
+ * processors, 2 to 8, and only for an intermediate file of 1 MB or more).
+ */
+typedef struct {
+  int type;                     /* 0: a code file directive, 1: a function name to look up */
+  size_t val;                   /* its operand (chunk-local index in val[]) */
+  size_t name;                  /* type 1: offset of the name in names[] */
+} LPEVENT;
+
+typedef struct {
+  const char *beg,*end;         /* whole lines of the intermediate file */
+  unsigned short *op;           /* records: index in opcodelist... */
+  size_t *arg;                  /* ... and first operand (chunk-local) */
+  size_t n,capop,caparg;
+  ucell *val;                   /* operands, as op_push() keeps them */
+  unsigned char *kind;
+  size_t nv,capval,capkind;
+  int *labidx;                  /* labels and their code address relative to the chunk */
+  cell *labat;
+  size_t nl,capidx,capat;
+  LPEVENT *ev;
+  size_t ne,cape;
+  char *names;
+  size_t nn,capn;
+  cell code;                    /* code size of the chunk */
+  int bad;
+} LPCHUNK;
+
+static int lp_grow(void **ptr,size_t *cap,size_t need,size_t elsize)
+{
+  size_t newcap;
+  void *grown;
+  if (need<=*cap)
+    return TRUE;
+  newcap=(*cap==0) ? 4096 : *cap*2;
+  while (newcap<need)
+    newcap*=2;
+  if ((grown=realloc(*ptr,newcap*elsize))==NULL)
+    return FALSE;
+  *ptr=grown;
+  *cap=newcap;
+  return TRUE;
+}
+
+static void lp_val(LPCHUNK *c,ucell value,unsigned char kind)
+{
+  if (!lp_grow((void **)&c->val,&c->capval,c->nv+1,sizeof *c->val)
+      || !lp_grow((void **)&c->kind,&c->capkind,c->nv+1,sizeof *c->kind)) {
+    c->bad=TRUE;
+    return;
+  } /* if */
+  c->val[c->nv]=value;
+  c->kind[c->nv]=kind;
+  c->nv++;
+}
+
+static void lp_event(LPCHUNK *c,int type,const char *name,size_t len)
+{
+  if (!lp_grow((void **)&c->ev,&c->cape,c->ne+1,sizeof *c->ev)) {
+    c->bad=TRUE;
+    return;
+  } /* if */
+  c->ev[c->ne].type=type;
+  c->ev[c->ne].val=c->nv;       /* the operand pushed next */
+  c->ev[c->ne].name=c->nn;
+  c->ne++;
+  if (type==1) {
+    if (!lp_grow((void **)&c->names,&c->capn,c->nn+len+1,1)) {
+      c->bad=TRUE;
+      return;
+    } /* if */
+    memcpy(c->names+c->nn,name,len);
+    c->names[c->nn+len]='\0';
+    c->nn+=len+1;
+  } /* if */
+}
+
+/* capture_param() of a chunk */
+static const char *lp_param(LPCHUNK *c,const char *s)
+{
+  if (s[0]=='.') {
+    const char *name=s+1;
+    for (s++; !isspace(*s); s++)
+      if (*s=='\0') {
+        c->bad=TRUE;
+        return s;
+      } /* if */
+    if (s-name>sNAMEMAX) {
+      c->bad=TRUE;
+      return s;
+    } /* if */
+    lp_event(c,1,name,(size_t)(s-name));
+    lp_val(c,0,0);              /* the function address, set by the merge */
+  } else if (s[0]=='l' && s[1]=='.') {
+    int i=(int)hex2long(s+2,NULL);
+    if (i<0 || i>=sc_labnum)
+      c->bad=TRUE;
+    lp_val(c,(ucell)i,1);       /* "s" stays at the label, as in capture_param() */
+  } else {
+    ucell result=0;
+    for ( ;; ) {
+      result+=hex2long(s,(char**)&s);
+      if (*s!='+')
+        break;
+      s++;
+    } /* for */
+    lp_val(c,result,0);
+  } /* if */
+  return s;
+}
+
+/* capture_instr() of a chunk: the code size of instruction "i" */
+static cell lp_instr(LPCHUNK *c,int i,char *params)
+{
+  OPCODE_PROC func=opcodelist[i].func;
+  int n=parm_count(func),k;
+
+  if (n>=0) {
+    for (k=0; k<n; k++)
+      params=(char *)lp_param(c,params);
+    return opcodes(1)+opargs(n);
+  } else if (func==do_jump) {
+    k=(int)hex2long(params,NULL);
+    if (k<0 || k>=sc_labnum)
+      c->bad=TRUE;
+    lp_val(c,(ucell)k,1);
+    return opcodes(1)+opargs(1);
+  } else if (func==do_call) {
+    char *name=params;
+    for ( ; !isspace(*params); params++)
+      if (*params=='\0' || params-name>sNAMEMAX) {
+        c->bad=TRUE;
+        return 0;
+      } /* if */
+    if (name[0]=='l' && name[1]=='.') {
+      k=(int)hex2long(name+2,NULL);
+      if (k<0 || k>=sc_labnum)
+        c->bad=TRUE;
+      lp_val(c,(ucell)k,1);
+    } else if (name[0]=='.') {
+      lp_event(c,1,name+1,(size_t)(params-name-1));
+      lp_val(c,0,0);
+    } else {
+      c->bad=TRUE;
+    } /* if */
+    return opcodes(1)+opargs(1);
+  } else if (func==do_case) {
+    ucell v=hex2long(params,&params);
+    k=(int)hex2long(params,NULL);
+    if (k<0 || k>=sc_labnum)
+      c->bad=TRUE;
+    lp_val(c,v,0);
+    lp_val(c,(ucell)k,1);
+    return opcodes(0)+opargs(2);
+  } else if (func==do_dump) {
+    size_t countpos=c->nv;
+    int num=0;
+    lp_val(c,0,0);              /* number of values, filled in below */
+    while (*params!='\0') {
+      lp_val(c,hex2long(params,&params),0);
+      num++;
+      while (isspace(*params))
+        params++;
+    } /* while */
+    if (!c->bad)
+      c->val[countpos]=(ucell)num;
+    return num*sizeof(cell);
+  } else if (func==do_dumpn) {
+    ucell value=hex2long(params,&params);
+    int num=(int)hex2long(params,NULL);
+    lp_val(c,value,0);
+    lp_val(c,(ucell)num,0);
+    return num*sizeof(cell);
+  } else if (func==set_currentfile) {
+    ucell result=0;
+    if (params[0]=='.' || (params[0]=='l' && params[1]=='.')) {
+      c->bad=TRUE;              /* getparam() of a function or a label: leave it to the serial pass */
+      return 0;
+    } /* if */
+    for ( ;; ) {
+      result+=hex2long(params,&params);
+      if (*params!='+')
+        break;
+      params++;
+    } /* for */
+    if (opcodelist[i].segment==sIN_CSEG)
+      lp_event(c,0,NULL,0);
+    lp_val(c,result,0);
+    return 0;
+  } else if (func!=noop) {
+    c->bad=TRUE;
+  } /* if */
+  return 0;
+}
+
+static void lp_run(void *arg)
+{
+  LPCHUNK *c=(LPCHUNK *)arg;
+  #if PAWN_CELL_SIZE > 32
+    char line[512];
+  #else
+    char line[256];
+  #endif
+  const char *p=c->beg;
+  char *instr,*params;
+  cell codeindex=0,size;
+  int i;
+
+  while (p<c->end && !c->bad) {
+    size_t len=sizeof line-1,avail=(size_t)(c->end-p);
+    const char *nl;
+    if (len>avail)
+      len=avail;
+    if ((nl=(const char *)memchr(p,'\n',len))!=NULL)
+      len=(size_t)(nl-p)+1;
+    memcpy(line,p,len);         /* the piece mfgets() would return */
+    line[len]='\0';
+    p+=len;
+    stripcomment(line);
+    instr=skipwhitespace(line);
+    if (*instr=='\0')
+      continue;
+    if (tolower(*instr)=='l' && *(instr+1)=='.') {
+      int lindex=(int)hex2long(instr+2,NULL);
+      if (lindex<0 || lindex>=sc_labnum
+          || !lp_grow((void **)&c->labidx,&c->capidx,c->nl+1,sizeof *c->labidx)
+          || !lp_grow((void **)&c->labat,&c->capat,c->nl+1,sizeof *c->labat)) {
+        c->bad=TRUE;
+        break;
+      } /* if */
+      c->labidx[c->nl]=lindex;
+      c->labat[c->nl]=codeindex;
+      c->nl++;
+    } else {
+      for (params=instr; *params!='\0' && !isspace(*params); params++)
+        /* nothing */;
+      i=findopcode(instr,(int)(params-instr));
+      if (opcodelist[i].name==NULL
+          || !lp_grow((void **)&c->op,&c->capop,c->n+1,sizeof *c->op)
+          || !lp_grow((void **)&c->arg,&c->caparg,c->n+1,sizeof *c->arg)) {
+        c->bad=TRUE;
+        break;
+      } /* if */
+      c->op[c->n]=(unsigned short)i;
+      c->arg[c->n]=c->nv;
+      c->n++;
+      size=lp_instr(c,i,skipwhitespace(params));
+      if (opcodelist[i].segment==sIN_CSEG)
+        codeindex+=size;
+    } /* if */
+  } /* while */
+  c->code=codeindex;
+}
+
+static void lp_free(LPCHUNK *c)
+{
+  free(c->op);
+  free(c->arg);
+  free(c->val);
+  free(c->kind);
+  free(c->labidx);
+  free(c->labat);
+  free(c->ev);
+  free(c->names);
+}
+
+/* room for "need" operands in opval[]/opkind[] */
+static int op_reserve(size_t need)
+{
+  size_t newcap=opcap;
+  ucell *newval;
+  unsigned char *newkind;
+  if (need<=opcap)
+    return TRUE;
+  if (newcap==0)
+    newcap=262144;
+  while (newcap<need)
+    newcap*=2;
+  if ((newval=(ucell *)realloc(opval,newcap*sizeof *opval))!=NULL)
+    opval=newval;
+  if ((newkind=(unsigned char *)realloc(opkind,newcap*sizeof *opkind))!=NULL)
+    opkind=newkind;
+  if (newval==NULL || newkind==NULL)
+    return FALSE;
+  opcap=newcap;
+  return TRUE;
+}
+
+/* room for "need" records in rec_off[]/rec_op[]/rec_arg[] */
+static int rec_reserve(size_t need)
+{
+  size_t newcap=rec_cap;
+  long *newoff;
+  unsigned short *newop;
+  size_t *newarg;
+  if (need<=rec_cap)
+    return TRUE;
+  if (newcap==0)
+    newcap=65536;
+  while (newcap<need)
+    newcap*=2;
+  if ((newoff=(long *)realloc(rec_off,newcap*sizeof *rec_off))!=NULL)
+    rec_off=newoff;
+  if ((newop=(unsigned short *)realloc(rec_op,newcap*sizeof *rec_op))!=NULL)
+    rec_op=newop;
+  if ((newarg=(size_t *)realloc(rec_arg,newcap*sizeof *rec_arg))!=NULL)
+    rec_arg=newarg;
+  if (newoff==NULL || newop==NULL || newarg==NULL)
+    return FALSE;               /* the arrays that did grow keep the old capacity: harmless */
+  rec_cap=newcap;
+  return TRUE;
+}
+
+/* The label pass on parallel chunks. FALSE: nothing usable (rec_num, opnum and fcurrent are as before), the
+ * serial pass must run. On success, *codesize is the code size of all instructions. */
+static int label_pass_parallel(FILE *fin,cell *codesize)
+{
+  LPCHUNK chunk[16];
+  void *args[16];
+  const char *buf;
+  long length;
+  int nchunks,c,ok=TRUE;
+  const char *env=getenv("PAWNCC_ASM_THREADS");
+  short fcurrent_before=fcurrent;
+  cell base=0;
+  size_t e,k,vbase;
+
+  if ((buf=pc_asmbuffer(fin,&length))==NULL || length<=0)
+    return FALSE;
+  if (env!=NULL && *env!='\0') {
+    nchunks=atoi(env);
+  } else {
+    if (length<(1L<<20))
+      return FALSE;
+    nchunks=pc_cpu_count()/2;  /* half the processors: the build runs a second compiler beside this one */
+    if (nchunks<2)
+      nchunks=2;
+    if (nchunks>8)
+      nchunks=8;
+  } /* if */
+  if (nchunks<2)
+    return FALSE;
+  if (nchunks>16)
+    nchunks=16;
+  (void)findopcode("nop",3);    /* builds the opcode hash table before the threads read it */
+
+  memset(chunk,0,sizeof chunk);
+  for (c=0; c<nchunks; c++) {
+    const char *at;
+    chunk[c].beg=(c==0) ? buf : chunk[c-1].end;
+    at=buf+(size_t)((long long)length*(c+1)/nchunks);
+    if (c==nchunks-1 || at<=chunk[c].beg) {
+      at=(c==nchunks-1) ? buf+length : chunk[c].beg;
+    } else {
+      const char *nl=(const char *)memchr(at-1,'\n',(size_t)(buf+length-(at-1)));
+      at=(nl==NULL) ? buf+length : nl+1;
+    } /* if */
+    chunk[c].end=at;
+    args[c]=&chunk[c];
+  } /* for */
+  pc_run_parallel(nchunks,lp_run,args);
+#ifdef PERF_TRACE
+  { char msg[80]; sprintf(msg,"asm: label chunks (%d threads)",nchunks); perf_pass(msg); }
+#endif
+
+  for (c=0; c<nchunks && ok; c++)
+    if (chunk[c].bad)
+      ok=FALSE;
+  /* merge, in file order */
+  for (c=0; c<nchunks && ok; c++) {
+    LPCHUNK *ch=&chunk[c];
+    if (!rec_reserve(rec_num+ch->n) || !op_reserve(opnum+ch->nv)) {
+      ok=FALSE;
+      break;
+    } /* if */
+    vbase=opnum;
+    if (ch->nv>0) {
+      memcpy(opval+opnum,ch->val,ch->nv*sizeof *opval);
+      memcpy(opkind+opnum,ch->kind,ch->nv*sizeof *opkind);
+      opnum+=ch->nv;
+    } /* if */
+    if (ch->n>0) {
+      memset(rec_off+rec_num,0,ch->n*sizeof *rec_off); /* not read back */
+      memcpy(rec_op+rec_num,ch->op,ch->n*sizeof *rec_op);
+      for (k=0; k<ch->n; k++)
+        rec_arg[rec_num+k]=vbase+ch->arg[k];
+      rec_num+=ch->n;
+    } /* if */
+    for (k=0; k<ch->nl; k++)
+      lbltab[ch->labidx[k]]=base+ch->labat[k];
+    for (e=0; e<ch->ne; e++) {
+      const LPEVENT *ev=&ch->ev[e];
+      if (ev->type==0) {
+        fcurrent=(short)opval[vbase+ev->val];
+      } else {
+        symbol *sym=findglb(ch->names+ev->name,sGLOBAL);
+        if (sym==NULL || (sym->ident!=iFUNCTN && sym->ident!=iREFFUNC) || sym->vclass!=sGLOBAL) {
+          ok=FALSE;
+          break;
+        } /* if */
+        opval[vbase+ev->val]=(ucell)sym->addr;
+      } /* if */
+    } /* for */
+    base+=ch->code;
+  } /* for */
+  for (c=0; c<nchunks; c++)
+    lp_free(&chunk[c]);
+  if (!ok) {
+    rec_num=0;
+    opnum=0;
+    fcurrent=fcurrent_before;
+    return FALSE;
+  } /* if */
+  *codesize=base;
+  return TRUE;
+}
+
 SC_FUNC int assemble(FILE *fout,FILE *fin)
 {
   AMX_HEADER hdr;
@@ -980,7 +1408,7 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
   char *instr,*params;
   size_t k;
   long linepos;
-  int i,pass,size;
+  int i,pass,size,parallel;
   int16_t count;
   symbol *sym, **nativelist;
   constvalue *constptr;
@@ -1282,7 +1710,8 @@ SC_FUNC int assemble(FILE *fout,FILE *fin)
     codeindex=0;
     pc_resetasm(fin);
     linepos=0;
-    while (pc_readasm(fin,line,sizeof line)!=NULL) {
+    parallel=label_pass_parallel(fin,&codeindex);
+    while (!parallel && pc_readasm(fin,line,sizeof line)!=NULL) {
       long thispos=linepos;
       linepos+=(long)strlen(line);
       stripcomment(line);

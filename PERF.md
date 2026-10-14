@@ -249,6 +249,24 @@ AMX as round 12.
 Found on the way: a Cyrillic file name without its extension (`#include "mod/ёлка"`) is not found in any
 version; the gamemode always writes `.inc`.
 
+## Round 14: the assembler's label pass on parallel chunks
+
+The assembler already parsed the intermediate text once (the code and data passes replay the records of
+the label pass), but that label pass went over 4.5 million lines on one thread: 0.66 s, the longest serial
+step after the parser. The intermediate file is in memory (`pc_asmbuffer`), so it is cut after a '\n' into
+chunks that threads parse like the serial loop (pieces as `mfgets()` returns them, the same handlers in a
+chunk-local form). The merge appends the chunks in file order: labels get the code size of the chunks
+before them, and the two order-dependent things -- "code" file directives (`fcurrent`) and the lookup of
+function names, which depends on `fcurrent` -- run in file order there. Anything the serial pass would
+report or assert on drops the parallel result and the serial pass runs. `PAWNCC_ASM_THREADS=n` sets the
+chunks (1: serial); by default half the processors, 2 to 8, for an intermediate file of 1 MB or more.
+
+Trace on a loaded machine (other builds running), median of 3 alternating runs: label pass 0.89 s serial,
+0.40 s on 4 chunks, 0.27 s on 8 (of which the merge ~0.09 s); quiet, the serial pass is 0.66 s. MODS ZONA
+stand: speculative compile 4.3 -> 3.7 s. Checks: gamemode AMX identical with 1, 4 and 8 chunks and to
+round 13; `compare-tests` 0 mismatches, `include-tests` PASS and `pass-tests` ALL OK with the parallel pass
+forced (`PAWNCC_ASM_THREADS=4` and `=2`, small scripts included).
+
 ## Remaining profile (not done)
 
 `stgwrite`/`assemble` text handling (the code generator writes text, the assembler parses it back three times),

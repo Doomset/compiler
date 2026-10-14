@@ -793,6 +793,69 @@ int pc_writeasm(void *handle,char *string)
   #endif
 }
 
+const char *pc_asmbuffer(void *handle,long *length)
+{
+  #if defined __MSDOS__ || defined SC_LIGHT
+    (void)handle;
+    *length=0;
+    return NULL;
+  #else
+    return mfbuffer((MEMFILE*)handle,length);
+  #endif
+}
+
+int pc_cpu_count(void)
+{
+  #if defined _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int)si.dwNumberOfProcessors;
+  #else
+    return 1;
+  #endif
+}
+
+#if defined _WIN32
+typedef struct { void (*fn)(void *); void *arg; } PC_THREADARG;
+static DWORD WINAPI pc_thread_main(LPVOID param)
+{
+  PC_THREADARG *t=(PC_THREADARG *)param;
+  t->fn(t->arg);
+  return 0;
+}
+#endif
+
+/* Runs fn(args[i]) for i=0..n-1: args[0] and any that could not get a thread on this thread, the others on
+ * threads of their own; returns when all are done. Without threads everything runs here, in order. */
+void pc_run_parallel(int n,void (*fn)(void *),void **args)
+{
+  int i;
+  #if defined _WIN32
+    HANDLE h[16];
+    PC_THREADARG t[16];
+    for (i=1; i<n; i++) {
+      h[i]=NULL;
+      if (i<16) {
+        t[i].fn=fn;
+        t[i].arg=args[i];
+        h[i]=CreateThread(NULL,0,pc_thread_main,&t[i],0,NULL);
+      } /* if */
+    } /* for */
+    fn(args[0]);
+    for (i=1; i<n; i++) {
+      if (i<16 && h[i]!=NULL) {
+        WaitForSingleObject(h[i],INFINITE);
+        CloseHandle(h[i]);
+      } else {
+        fn(args[i]);
+      } /* if */
+    } /* for */
+  #else
+    for (i=0; i<n; i++)
+      fn(args[i]);
+  #endif
+}
+
 char *pc_readasm(void *handle, char *string, int maxchars)
 {
   #if defined __MSDOS__ || defined SC_LIGHT

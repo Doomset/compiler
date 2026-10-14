@@ -706,6 +706,9 @@ void pc_resetasm(void *handle);
 long pc_seekasm(void *handle,long offset);
 int  pc_writeasm(void *handle,char *str);
 char *pc_readasm(void *handle,char *string,int maxchars);
+const char *pc_asmbuffer(void *handle,long *length); /* the whole file in memory, or NULL */
+int  pc_cpu_count(void);
+void pc_run_parallel(int n,void (*fn)(void *),void **args); /* fn(args[0..n-1]), on threads where possible */
 
 /* output to binary (.AMX) file */
 void *pc_openbin(char *filename);
@@ -980,6 +983,7 @@ unsigned int mfwrite(MEMFILE *mf,const unsigned char *buffer,unsigned int size);
 unsigned int mfread(MEMFILE *mf,unsigned char *buffer,unsigned int size);
 char *mfgets(MEMFILE *mf,char *string,unsigned int size);
 int mfputs(MEMFILE *mf,const char *string);
+const char *mfbuffer(const MEMFILE *mf,long *length);
 
 /* function prototypes in SCI18N.C */
 #define MAXCODEPAGE 12

@@ -139,6 +139,13 @@ char *mfgets(MEMFILE *mf,char *string,unsigned int size)
   return string;
 }
 
+const char *mfbuffer(const MEMFILE *mf,long *length)
+{
+  assert(mf!=NULL);
+  *length=mf->usedoffs;
+  return mf->base;
+}
+
 int mfputs(MEMFILE *mf,const char *string)
 {
   unsigned int written,length;

@@ -972,6 +972,7 @@ SC_FUNC void ck_str(ckio *io,char **s);
 SC_FUNC void ck_fail(ckio *io);
 SC_FUNC void ck_libref(ckio *io,constvalue **lib);
 SC_FUNC void ckpt_visit_sc1(ckio *io);
+SC_FUNC cell ckpt_now(void);
 SC_FUNC void ckpt_visit_sc2(ckio *io);
 SC_FUNC void ckpt_glbtab_link(symbol **made,int count,const int *htnext);
 SC_FUNC int ckpt_level_count(void);

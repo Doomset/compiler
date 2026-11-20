@@ -313,7 +313,12 @@ static void ck_symbols(ckio *io,symbol **pcurfunc)
     int htnext=io->wr ? symref(sym->htnext) : 0;
     int nref=0;
     ck_name(io,s->name);
-    CKV(io,s->addr);
+    if (io->wr && (s->flags & flagPREDEF)!=0 && strcmp(s->name,"__timestamp")==0) {
+      cell zero=0;          /* the time of the saving compile: not part of the state */
+      CKV(io,zero);
+    } else {
+      CKV(io,s->addr);
+    } /* if */
     CKV(io,s->codeaddr);
     CKV(io,s->vclass);
     CKV(io,s->ident);
@@ -445,6 +450,8 @@ static void ck_symbols(ckio *io,symbol **pcurfunc)
       free(p->refers);
       if ((n->flags & flagPREDEF)!=0 && strcmp(n->name,"__line")==0)
         line_sym=n;
+      if ((n->flags & flagPREDEF)!=0 && strcmp(n->name,"__timestamp")==0)
+        n->addr=ckpt_now();
     } /* for */
     ckpt_glbtab_link(made,count,htnext);
     *pcurfunc=(i>0 && i<=count) ? made[i-1] : NULL;
@@ -641,51 +648,62 @@ static int ck_load(const char *path)
 }
 
 /* ----- the files a stretch of the pass reads ------------------------------------------------- *
- * "F <name>" for a file it opened, "D <directory>" for the directory of a name it looked for and did
- * not find (a new file there could change what an #include finds). A caller compares sizes and
- * times of these to decide which segments an edit touched. */
+ * "F <name>" for a file it opened, "M <name>" for a name it looked for and did not find (a file
+ * made there could change what an #include finds). A caller compares the sizes and times of the
+ * first and the absence of the second to decide which segments an edit touched. */
 
 static char **ck_files=NULL;
 static int ck_nfiles=0,ck_capfiles=0;
+static int *ck_fhash=NULL;      /* open addressing: 1-based numbers into ck_files, 0 empty */
+static int ck_fhsize=0;         /* a power of two, at least twice ck_capfiles */
+
+static unsigned long ck_strhash(const char *s)
+{
+  unsigned long h=2166136261UL;
+  while (*s!='\0')
+    h=(h^(unsigned char)*s++)*16777619UL;
+  return h;
+}
 
 static void ck_file_add(const char *kind,const char *name)
 {
   char entry[_MAX_PATH+8];
-  int i;
+  unsigned h;
   if (strlen(name)>_MAX_PATH)
-    return;
+    name="?";               /* "F ?" / "M ?": a caller cannot check it and runs the segment */
   sprintf(entry,"%s %s",kind,name);
-  for (i=0; i<ck_nfiles; i++)
-    if (strcmp(ck_files[i],entry)==0)
-      return;
   if (ck_nfiles==ck_capfiles) {
-    int cap=(ck_capfiles==0) ? 64 : 2*ck_capfiles;
+    int cap=(ck_capfiles==0) ? 256 : 2*ck_capfiles;
+    int i;
     char **p=(char**)realloc(ck_files,(size_t)cap*sizeof(char*));
-    if (p==NULL)
-      return;
+    int *t=(int*)calloc((size_t)cap*2,sizeof(int));
+    if (p==NULL || t==NULL)
+      error(103);           /* insufficient memory */
     ck_files=p;
     ck_capfiles=cap;
+    free(ck_fhash);
+    ck_fhash=t;
+    ck_fhsize=cap*2;
+    for (i=0; i<ck_nfiles; i++) {
+      h=(unsigned)ck_strhash(ck_files[i]) & (unsigned)(ck_fhsize-1);
+      while (ck_fhash[h]!=0)
+        h=(h+1) & (unsigned)(ck_fhsize-1);
+      ck_fhash[h]=i+1;
+    } /* for */
   } /* if */
+  h=(unsigned)ck_strhash(entry) & (unsigned)(ck_fhsize-1);
+  while (ck_fhash[h]!=0) {
+    if (strcmp(ck_files[ck_fhash[h]-1],entry)==0)
+      return;
+    h=(h+1) & (unsigned)(ck_fhsize-1);
+  } /* while */
   ck_files[ck_nfiles++]=duplicatestring(entry);
+  ck_fhash[h]=ck_nfiles;
 }
 
 static void ck_srcopen(const char *name,int found)
 {
-  if (found) {
-    ck_file_add("F",name);
-  } else {
-    char dir[_MAX_PATH+1];
-    char *p;
-    strcpy(dir,name);
-    p=strrchr(dir,'\\');
-    if (p==NULL || (strrchr(dir,'/')!=NULL && strrchr(dir,'/')>p))
-      p=strrchr(dir,'/');
-    if (p!=NULL)
-      *p='\0';
-    else
-      strcpy(dir,".");
-    ck_file_add("D",dir);
-  } /* if */
+  ck_file_add(found ? "F" : "M",name);
 }
 
 /* the files of the include levels open now: a stretch that starts here goes on reading them */
@@ -695,6 +713,8 @@ static void ck_files_reset(void)
   for (i=0; i<ck_nfiles; i++)
     free(ck_files[i]);
   ck_nfiles=0;
+  if (ck_fhash!=NULL)
+    memset(ck_fhash,0,(size_t)ck_fhsize*sizeof(int));
   for (i=0; i<ckpt_level_count(); i++) {
     int fnum,line;
     FILE *h;
@@ -929,21 +949,17 @@ typedef struct {
   int htcap;
 } ckinfo;
 
-static unsigned long ck_strhash(const char *s)
-{
-  unsigned long h=2166136261UL;
-  while (*s!='\0')
-    h=(h^(unsigned char)*s++)*16777619UL;
-  return h;
-}
+
 
 static int cmp_str(const void *a,const void *b)
 {
   return strcmp(*(char*const*)a,*(char*const*)b);
 }
 
-/* identity of a symbol across states: name, kind, class, file of a static, and the number of
- * earlier symbols with all of these equal */
+/* identity of a symbol across states: name, kind, class, file of a static, the parent (an enum
+ * field: two enums may have fields of one name), and the number of symbols with all of these equal
+ * behind it in the list (a new symbol goes in front of those with an equal name, so the older ones
+ * keep their numbers) */
 static char **ck_keys(int *count)
 {
   symbol *sym;
@@ -965,10 +981,15 @@ static char **ck_keys(int *count)
     if (seen==NULL || dup==NULL)
       error(103);
     for (sym=glbtab.next, i=0; sym!=NULL; sym=sym->next, i++) {
-      char base[sNAMEMAX+64],full[sNAMEMAX+80];
+      char base[2*sNAMEMAX+64];
+      sprintf(base,"%s|%d|%d|%d|%s",sym->name,sym->ident,sym->vclass,sym->fnumber,
+              (sym->parent!=NULL) ? sym->parent->name : "");
+      keys[i]=duplicatestring(base);
+    } /* for */
+    for (i=n-1; i>=0; i--) {
+      char *base=keys[i],full[2*sNAMEMAX+80];
       unsigned long h;
       int slot;
-      sprintf(base,"%s|%d|%d|%d",sym->name,sym->ident,sym->vclass,sym->fnumber);
       h=ck_strhash(base);
       for (slot=(int)(h&(unsigned long)(cap-1)); seen[slot]!=NULL && strcmp(seen[slot],base)!=0; slot=(slot+1)&(cap-1))
         /* nothing */;
@@ -976,6 +997,7 @@ static char **ck_keys(int *count)
         seen[slot]=duplicatestring(base);
       sprintf(full,"%s|%d",base,dup[slot]++);
       keys[i]=duplicatestring(full);
+      free(base);
     } /* for */
     for (i=0; i<cap; i++)
       free(seen[i]);
@@ -1188,7 +1210,10 @@ static void ck_relocate(const ckinfo *a,const ckinfo *b)
     int ia=ck_find(a,keys[i]),ib=ck_find(b,keys[i]);
     const cksym *ca=(ia>=0) ? &a->syms[ia] : NULL;
     const cksym *cb=(ib>=0) ? &b->syms[ib] : NULL;
+    /* the address of a function is in the code; so is that of a native while it is the code
+     * address of its declaration (fetchfunc() puts it there; the second pass numbers natives) */
     int isfunc=(sym->ident==iFUNCTN && (sym->usage & uNATIVE)==0);
+    int addrcode=(isfunc || (sym->ident==iFUNCTN && sym->addr==sym->codeaddr));
     int isvar=((sym->ident==iVARIABLE || sym->ident==iARRAY) && sym->vclass!=sLOCAL);
     int dline;
     long dpos;
@@ -1196,7 +1221,7 @@ static void ck_relocate(const ckinfo *a,const ckinfo *b)
       sym->usage=(short)(unsigned short)(((unsigned short)sym->usage) ^ (ca->usage ^ cb->usage));
       if (sym->addr==ca->addr)
         sym->addr=cb->addr;
-      else if (isfunc && CK_IN(sym->addr,c_lo,c_hi))
+      else if (addrcode && CK_IN(sym->addr,c_lo,c_hi))
         sym->addr+=dcode;
       else if (isvar && CK_IN(sym->addr,d_lo,d_hi))
         sym->addr+=ddata;
@@ -1228,7 +1253,7 @@ static void ck_relocate(const ckinfo *a,const ckinfo *b)
       /* made after the start of segment j+1 */
       if (CK_IN(sym->codeaddr,c_lo,c_hi))
         sym->codeaddr+=dcode;
-      if (isfunc && CK_IN(sym->addr,c_lo,c_hi))
+      if (addrcode && CK_IN(sym->addr,c_lo,c_hi))
         sym->addr+=dcode;
       else if (isvar && CK_IN(sym->addr,d_lo,d_hi))
         sym->addr+=ddata;

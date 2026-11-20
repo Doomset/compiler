@@ -9160,5 +9160,11 @@ SC_FUNC void ckpt_visit_sc1(ckio *io)
     memset(wq+wqi,0,(size_t)(wqTABSZ-wqi)*sizeof(int));
     wqptr=wq+wqi;
   } /* if */
-  CKV(io,now);
+  /* "now" stays the time of this process: a checkpoint does not carry the time of the compile that
+   * saved it (__date and __time are made at the start of a pass, __timestamp see scckpt.c) */
+}
+
+SC_FUNC cell ckpt_now(void)
+{
+  return (cell)now;
 }

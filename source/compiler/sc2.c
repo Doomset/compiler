@@ -3886,8 +3886,10 @@ SC_FUNC void markusage(symbol *sym,int usage)
 {
   assert(sym!=NULL);
   sym->usage |= (short)(unsigned short)usage;
-  if ((usage & uWRITTEN)!=0)
+  if ((usage & uWRITTEN)!=0) {
     sym->lnumber=fline;
+    sym->lfile=fcurrent;
+  } /* if */
   if ((usage & uREAD)!=0 && (sym->ident==iVARIABLE || sym->ident==iREFERENCE))
     sym->usage &= ~(uASSIGNED | uMODIFIED);
   if ((usage & (uREAD | uWRITTEN))!=0 && (sym->ident==iVARIABLE || sym->ident==iREFERENCE))
@@ -4122,6 +4124,7 @@ SC_FUNC symbol *addsym(const char *name,cell addr,int ident,int vclass,int tag,i
   entry.assignlevel=0;
   entry.fnumber=-1;     /* assume global visibility (ignored for local symbols) */
   entry.lnumber=fline;
+  entry.lfile=fcurrent;
   entry.numrefers=1;
   entry.refer=refer;
 
@@ -4396,4 +4399,31 @@ SC_FUNC void ckpt_visit_sc2(ckio *io)
   ck_str(io,&inpfname);
   if (!writing)
     inpf_org=(nframes>0) ? (FILE*)stack[0].pv : inpf;
+}
+
+/* the include levels of a checkpoint, the file read now last: its file number, line and handle */
+SC_FUNC int ckpt_level_count(void)
+{
+  return stkidx/CK_FRAME+1;
+}
+
+SC_FUNC void ckpt_level_get(int i,int *fnum,int *line,FILE **h)
+{
+  if (i<stkidx/CK_FRAME) {
+    *fnum=stack[i*CK_FRAME+7].i;
+    *line=stack[i*CK_FRAME+8].i;
+    *h=(FILE*)stack[i*CK_FRAME].pv;
+  } else {
+    *fnum=fcurrent;
+    *line=fline;
+    *h=inpf;
+  } /* if */
+}
+
+SC_FUNC void ckpt_level_setline(int i,int line)
+{
+  if (i<stkidx/CK_FRAME)
+    stack[i*CK_FRAME+8].i=line;
+  else
+    fline=line;
 }

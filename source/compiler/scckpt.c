@@ -319,6 +319,7 @@ static void ck_symbols(ckio *io,symbol **pcurfunc)
     CKV(io,s->assignlevel);
     CKV(io,s->fnumber);
     CKV(io,s->lnumber);
+    CKV(io,s->lfile);
     CKV(io,s->memo_stack);
     CKV(io,s->memo_valid);
     CKV(io,parent);
@@ -755,15 +756,389 @@ SC_FUNC void ckpt_boundary(void)
   } /* if */
 }
 
+/* ----- relocation ---------------------------------------------------------------------------- *
+ *
+ * An edit inside a function body of segment j moves what comes after it: code and data addresses,
+ * label numbers, line numbers and file positions in the edited file; it may also change usage
+ * flags and referrers. The old checkpoints after it are then off by that difference. With
+ * PAWNCC_SEG_RELOC_A=<a> and PAWNCC_SEG_RELOC_B=<b> a segment applies the difference between
+ * <a> (the old start of segment j+1) and <b> (the new end of segment j) to its own start:
+ *   - counters (code_idx, glb_declared, labels): plus the difference;
+ *   - a symbol field that segment j changed and that is unchanged since: the new value; one that
+ *     was set after <a> (a function or variable defined later): shifted by the code or data
+ *     difference, a line number by the line difference of its file;
+ *   - usage flags: the bits segment j changed flip; referrers: the set difference;
+ *   - include levels of a file whose position moved: line and position plus the difference.
+ * This is a guess with a check: the segment's end state must still equal the next start.
+ */
+
+typedef struct {
+  char *key;
+  cell addr,codeaddr;
+  int usage,lnumber,lfile;
+  long stacksize;
+  int nrefs;
+  char **refs;          /* keys of the referrers, sorted */
+  int nargs;
+  cell *argaddr;        /* data addresses of default arrays of the arguments (0 for the others) */
+  int nstates;
+  cell *statev;         /* values of the state list (code addresses of the state implementations) */
+} cksym;
+
+typedef struct {
+  cell code_idx,glb_declared;
+  int labnum,errnum,warnnum;
+  int nlev;
+  int lev_f[sCOMP_STACK+64],lev_line[sCOMP_STACK+64];
+  size_t lev_pos[sCOMP_STACK+64];
+  int nsym;
+  cksym *syms;
+  int *ht;
+  int htcap;
+} ckinfo;
+
+static unsigned long ck_strhash(const char *s)
+{
+  unsigned long h=2166136261UL;
+  while (*s!='\0')
+    h=(h^(unsigned char)*s++)*16777619UL;
+  return h;
+}
+
+static int cmp_str(const void *a,const void *b)
+{
+  return strcmp(*(char*const*)a,*(char*const*)b);
+}
+
+/* identity of a symbol across states: name, kind, class, file of a static, and the number of
+ * earlier symbols with all of these equal */
+static char **ck_keys(int *count)
+{
+  symbol *sym;
+  char **keys;
+  int n=0,i;
+  for (sym=glbtab.next; sym!=NULL; sym=sym->next)
+    sym->work=++n;
+  if ((keys=(char**)calloc((size_t)n+1,sizeof(char*)))==NULL)
+    error(103);
+  {
+    /* duplicates: a small open hash of the plain key */
+    int cap=1;
+    char **seen;
+    int *dup;
+    while (cap<2*n+2)
+      cap*=2;
+    seen=(char**)calloc((size_t)cap,sizeof(char*));
+    dup=(int*)calloc((size_t)cap,sizeof(int));
+    if (seen==NULL || dup==NULL)
+      error(103);
+    for (sym=glbtab.next, i=0; sym!=NULL; sym=sym->next, i++) {
+      char base[sNAMEMAX+64],full[sNAMEMAX+80];
+      unsigned long h;
+      int slot;
+      sprintf(base,"%s|%d|%d|%d",sym->name,sym->ident,sym->vclass,sym->fnumber);
+      h=ck_strhash(base);
+      for (slot=(int)(h&(unsigned long)(cap-1)); seen[slot]!=NULL && strcmp(seen[slot],base)!=0; slot=(slot+1)&(cap-1))
+        /* nothing */;
+      if (seen[slot]==NULL)
+        seen[slot]=duplicatestring(base);
+      sprintf(full,"%s|%d",base,dup[slot]++);
+      keys[i]=duplicatestring(full);
+    } /* for */
+    for (i=0; i<cap; i++)
+      free(seen[i]);
+    free(seen);
+    free(dup);
+  }
+  *count=n;
+  return keys;
+}
+
+static int ck_find(const ckinfo *ci,const char *key)
+{
+  int slot;
+  if (ci->htcap==0)
+    return -1;
+  for (slot=(int)(ck_strhash(key)&(unsigned long)(ci->htcap-1)); ci->ht[slot]>=0; slot=(slot+1)&(ci->htcap-1))
+    if (strcmp(ci->syms[ci->ht[slot]].key,key)==0)
+      return ci->ht[slot];
+  return -1;
+}
+
+/* takes what relocation needs from the state loaded now */
+static void ck_capture(ckinfo *ci)
+{
+  symbol *sym;
+  char **keys;
+  int n,i,k;
+  memset(ci,0,sizeof(ckinfo));
+  ci->code_idx=code_idx;
+  ci->glb_declared=glb_declared;
+  ci->labnum=sc_labnum;
+  ci->errnum=errnum;
+  ci->warnnum=warnnum;
+  ci->nlev=ckpt_level_count();
+  if (ci->nlev>(int)arraysize(ci->lev_f))
+    ci->nlev=(int)arraysize(ci->lev_f);
+  for (i=0; i<ci->nlev; i++) {
+    FILE *h;
+    ckpt_level_get(i,&ci->lev_f[i],&ci->lev_line[i],&h);
+    ci->lev_pos[i]=(h!=NULL) ? pc_srcpos(h,NULL) : 0;
+  } /* for */
+  keys=ck_keys(&n);
+  ci->nsym=n;
+  if ((ci->syms=(cksym*)calloc((size_t)n+1,sizeof(cksym)))==NULL)
+    error(103);
+  ci->htcap=1;
+  while (ci->htcap<2*n+2)
+    ci->htcap*=2;
+  if ((ci->ht=(int*)malloc((size_t)ci->htcap*sizeof(int)))==NULL)
+    error(103);
+  for (i=0; i<ci->htcap; i++)
+    ci->ht[i]=-1;
+  for (sym=glbtab.next, i=0; sym!=NULL; sym=sym->next, i++) {
+    cksym *c=&ci->syms[i];
+    int slot;
+    c->key=keys[i];
+    c->addr=sym->addr;
+    c->codeaddr=sym->codeaddr;
+    c->usage=(unsigned short)sym->usage;
+    c->lnumber=sym->lnumber;
+    c->lfile=sym->lfile;
+    c->stacksize=(sym->ident==iFUNCTN && (sym->usage & uNATIVE)==0) ? sym->x.stacksize : 0;
+    if ((c->refs=(char**)malloc(((size_t)sym->numrefers+1)*sizeof(char*)))==NULL)
+      error(103);
+    for (k=0; k<sym->numrefers; k++)
+      if (sym->refer[k]!=NULL && sym->refer[k]->work>0 && sym->refer[k]->work<=n)
+        c->refs[c->nrefs++]=keys[sym->refer[k]->work-1];
+    qsort(c->refs,(size_t)c->nrefs,sizeof(char*),cmp_str);
+    if (sym->states!=NULL) {
+      constvalue *cv;
+      for (cv=sym->states->first; cv!=NULL; cv=cv->next)
+        c->nstates++;
+      if ((c->statev=(cell*)calloc((size_t)c->nstates+1,sizeof(cell)))==NULL)
+        error(103);
+      for (k=0, cv=sym->states->first; cv!=NULL; cv=cv->next, k++)
+        c->statev[k]=cv->value;
+    } /* if */
+    if (sym->ident==iFUNCTN && sym->dim.arglist!=NULL) {
+      arginfo *arg;
+      for (arg=sym->dim.arglist; arg->ident!=0; arg++)
+        c->nargs++;
+      if ((c->argaddr=(cell*)calloc((size_t)c->nargs+1,sizeof(cell)))==NULL)
+        error(103);
+      for (k=0, arg=sym->dim.arglist; arg->ident!=0; arg++, k++)
+        if (arg->ident==iREFARRAY && arg->hasdefault)
+          c->argaddr[k]=arg->defvalue.array.addr;
+    } /* if */
+    for (slot=(int)(ck_strhash(c->key)&(unsigned long)(ci->htcap-1)); ci->ht[slot]>=0; slot=(slot+1)&(ci->htcap-1))
+      /* nothing */;
+    ci->ht[slot]=i;
+  } /* for */
+  for (sym=glbtab.next; sym!=NULL; sym=sym->next)
+    sym->work=0;
+  free(keys);           /* the strings live on in the records */
+}
+
+static int ck_hasref(const cksym *c,const char *key)
+{
+  return c!=NULL && bsearch(&key,c->refs,(size_t)c->nrefs,sizeof(char*),cmp_str)!=NULL;
+}
+
+static int ck_linedelta(const ckinfo *a,const ckinfo *b,int fnum,int *dline,long *dpos)
+{
+  int i;
+  for (i=0; i<a->nlev && i<b->nlev; i++) {
+    if (a->lev_f[i]!=b->lev_f[i])
+      break;
+    if (a->lev_f[i]==fnum) {
+      *dline=b->lev_line[i]-a->lev_line[i];
+      *dpos=(long)b->lev_pos[i]-(long)a->lev_pos[i];
+      return TRUE;
+    } /* if */
+  } /* for */
+  return FALSE;
+}
+
+/* applies b - a to the state loaded now */
+static void ck_relocate(const ckinfo *a,const ckinfo *b)
+{
+  cell dcode=b->code_idx-a->code_idx;
+  cell ddata=(b->glb_declared-a->glb_declared)*(cell)sizeof(cell);
+  symbol *sym;
+  char **keys;
+  int n,i,k;
+
+  /* a code or data address that this state set after <a> lies between the counters of <a> and the
+   * counters of this state; values outside (from the first pass, say) stay */
+  cell c_lo=a->code_idx,c_hi=code_idx;
+  cell d_lo=a->glb_declared*(cell)sizeof(cell),d_hi=glb_declared*(cell)sizeof(cell);
+  #define CK_IN(v,lo,hi)  ((v)>=(lo) && (v)<=(hi))
+
+  code_idx+=dcode;
+  glb_declared+=b->glb_declared-a->glb_declared;
+  sc_labnum+=b->labnum-a->labnum;
+  errnum+=b->errnum-a->errnum;
+  warnnum+=b->warnnum-a->warnnum;
+
+  /* include levels: a file whose position at the boundary moved */
+  for (i=0; i<ckpt_level_count(); i++) {
+    int fnum,line,dline;
+    long dpos;
+    FILE *h;
+    ckpt_level_get(i,&fnum,&line,&h);
+    if (ck_linedelta(a,b,fnum,&dline,&dpos)) {
+      ckpt_level_setline(i,line+dline);
+      if (h!=NULL) {
+        int eof;
+        size_t pos=pc_srcpos(h,&eof);
+        pc_srcsetpos(h,(size_t)((long)pos+dpos),eof);
+      } /* if */
+    } /* if */
+  } /* for */
+  if (line_sym!=NULL)
+    line_sym->addr=fline;
+
+  keys=ck_keys(&n);
+  for (sym=glbtab.next, i=0; sym!=NULL; sym=sym->next, i++) {
+    int ia=ck_find(a,keys[i]),ib=ck_find(b,keys[i]);
+    const cksym *ca=(ia>=0) ? &a->syms[ia] : NULL;
+    const cksym *cb=(ib>=0) ? &b->syms[ib] : NULL;
+    int isfunc=(sym->ident==iFUNCTN && (sym->usage & uNATIVE)==0);
+    int isvar=((sym->ident==iVARIABLE || sym->ident==iARRAY) && sym->vclass!=sLOCAL);
+    int dline;
+    long dpos;
+    if (ca!=NULL && cb!=NULL) {
+      sym->usage=(short)(unsigned short)(((unsigned short)sym->usage) ^ (ca->usage ^ cb->usage));
+      if (sym->addr==ca->addr)
+        sym->addr=cb->addr;
+      else if (isfunc && CK_IN(sym->addr,c_lo,c_hi))
+        sym->addr+=dcode;
+      else if (isvar && CK_IN(sym->addr,d_lo,d_hi))
+        sym->addr+=ddata;
+      if (sym->codeaddr==ca->codeaddr)
+        sym->codeaddr=cb->codeaddr;
+      else if (CK_IN(sym->codeaddr,c_lo,c_hi))
+        sym->codeaddr+=dcode;
+      if (sym->lnumber==ca->lnumber && sym->lfile==ca->lfile) {
+        sym->lnumber=cb->lnumber;
+        sym->lfile=cb->lfile;
+      } else if (ck_linedelta(a,b,sym->lfile,&dline,&dpos)) {
+        sym->lnumber+=dline;
+      } /* if */
+      if (isfunc && sym->x.stacksize==ca->stacksize)
+        sym->x.stacksize=cb->stacksize;
+      if (sym->ident==iFUNCTN && sym->dim.arglist!=NULL) {
+        /* default arrays of arguments live in the data segment, put there by the declaration */
+        arginfo *arg;
+        for (k=0, arg=sym->dim.arglist; arg->ident!=0; arg++, k++) {
+          if (arg->ident!=iREFARRAY || !arg->hasdefault)
+            continue;
+          if (k<ca->nargs && k<cb->nargs && arg->defvalue.array.addr==ca->argaddr[k])
+            arg->defvalue.array.addr=cb->argaddr[k];
+          else if (CK_IN(arg->defvalue.array.addr,d_lo,d_hi))
+            arg->defvalue.array.addr+=ddata;
+        } /* for */
+      } /* if */
+    } else if (ca==NULL) {
+      /* made after the start of segment j+1 */
+      if (CK_IN(sym->codeaddr,c_lo,c_hi))
+        sym->codeaddr+=dcode;
+      if (isfunc && CK_IN(sym->addr,c_lo,c_hi))
+        sym->addr+=dcode;
+      else if (isvar && CK_IN(sym->addr,d_lo,d_hi))
+        sym->addr+=ddata;
+      if (sym->ident==iFUNCTN && sym->dim.arglist!=NULL) {
+        arginfo *arg;
+        for (arg=sym->dim.arglist; arg->ident!=0; arg++)
+          if (arg->ident==iREFARRAY && arg->hasdefault && CK_IN(arg->defvalue.array.addr,d_lo,d_hi))
+            arg->defvalue.array.addr+=ddata;
+      } /* if */
+      if (ck_linedelta(a,b,sym->lfile,&dline,&dpos))
+        sym->lnumber+=dline;
+    } /* if */
+    if (sym->ident==iFUNCTN && sym->states!=NULL) {
+      /* the code address of every state implementation */
+      constvalue *cv;
+      for (k=0, cv=sym->states->first; cv!=NULL; cv=cv->next, k++) {
+        if (ca!=NULL && cb!=NULL && k<ca->nstates && k<cb->nstates && cv->value==ca->statev[k])
+          cv->value=cb->statev[k];
+        else if (CK_IN(cv->value,c_lo,c_hi))
+          cv->value+=dcode;
+      } /* for */
+    } /* if */
+    sym->work=i+1;
+  } /* for */
+
+  /* referrers: drop those segment j dropped, add those it added */
+  for (sym=glbtab.next, i=0; sym!=NULL; sym=sym->next, i++) {
+    int ia=ck_find(a,keys[i]),ib=ck_find(b,keys[i]);
+    const cksym *ca=(ia>=0) ? &a->syms[ia] : NULL;
+    const cksym *cb=(ib>=0) ? &b->syms[ib] : NULL;
+    if (ca==NULL || cb==NULL)
+      continue;
+    for (k=0; k<sym->numrefers; k++) {
+      if (sym->refer[k]!=NULL && sym->refer[k]->work>0) {
+        const char *rk=keys[sym->refer[k]->work-1];
+        if (ck_hasref(ca,rk) && !ck_hasref(cb,rk))
+          sym->refer[k]=NULL;
+      } /* if */
+    } /* for */
+    for (k=0; k<cb->nrefs; k++) {
+      if (!ck_hasref(ca,cb->refs[k])) {
+        /* find the referrer by its key in this state */
+        symbol *r;
+        int j;
+        for (r=glbtab.next, j=0; r!=NULL; r=r->next, j++)
+          if (strcmp(keys[j],cb->refs[k])==0)
+            break;
+        if (r!=NULL)
+          refer_symbol(sym,r);
+      } /* if */
+    } /* for */
+  } /* for */
+  for (sym=glbtab.next; sym!=NULL; sym=sym->next)
+    sym->work=0;
+  for (i=0; i<n; i++)
+    free(keys[i]);
+  free(keys);
+}
+
+static void ck_loadinfo(const char *path,ckinfo *ci)
+{
+  if (!ck_load(path)) {
+    pc_printf("[ckpt] cannot load %s\n",path);
+    exit(4);
+  } /* if */
+  ck_capture(ci);
+}
+
 /* PAWNCC_SEG_LOAD: put the state of a checkpoint in place; parse() continues from there */
 SC_FUNC int ckpt_load_start(void)
 {
   const char *path=getenv("PAWNCC_SEG_LOAD");
+  const char *ra=getenv("PAWNCC_SEG_RELOC_A");
+  const char *rb=getenv("PAWNCC_SEG_RELOC_B");
+  ckinfo ia,ib;
+  int reloc=(ra!=NULL && *ra!='\0' && rb!=NULL && *rb!='\0');
   if (path==NULL || *path=='\0')
     return FALSE;
+  if (reloc) {
+    ck_loadinfo(rb,&ib);
+    ck_loadinfo(ra,&ia);
+  } /* if */
   if (!ck_load(path)) {
     pc_printf("[ckpt] cannot load %s\n",path);
     exit(4);
+  } /* if */
+  if (reloc) {
+    ck_relocate(&ia,&ib);   /* the records are not freed: the process ends with the segment */
+    if (ck_out!=NULL || getenv("PAWNCC_SEG_OUT")!=NULL) {
+      /* the start this segment really used, for the chain check */
+      char name[_MAX_PATH+16];
+      sprintf(name,"%s.start.ck",getenv("PAWNCC_SEG_OUT"));
+      ck_save(name);
+    } /* if */
   } /* if */
   ck_dbgstart=dbgstring_count();
   ckpt_init();

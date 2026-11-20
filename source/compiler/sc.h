@@ -180,6 +180,7 @@ typedef struct s_symbol {
   constvalue_root *states;/* list of state function/state variable ids + addresses */
   int fnumber;          /* static global variables: file number in which the declaration is visible */
   int lnumber;          /* line number (in the current source file) for the declaration */
+  int lfile;            /* the file (fcurrent) of lnumber: for checkpoints (scckpt.c) */
   struct s_symbol **refer;  /* referrer list, functions that "use" this symbol */
   int numrefers;        /* number of entries in the referrer list */
   char *documentation;  /* optional documentation string */
@@ -973,6 +974,9 @@ SC_FUNC void ck_libref(ckio *io,constvalue **lib);
 SC_FUNC void ckpt_visit_sc1(ckio *io);
 SC_FUNC void ckpt_visit_sc2(ckio *io);
 SC_FUNC void ckpt_glbtab_link(symbol **made,int count,const int *htnext);
+SC_FUNC int ckpt_level_count(void);
+SC_FUNC void ckpt_level_get(int i,int *fnum,int *line,FILE **h);
+SC_FUNC void ckpt_level_setline(int i,int line);
 SC_FUNC void ckpt_visit_sc3(ckio *io);
 SC_FUNC void ckpt_visit_sc4(ckio *io);
 SC_FUNC void ckpt_visit_sc5(ckio *io);

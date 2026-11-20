@@ -554,11 +554,15 @@ static SRCCACHE *srccache_load(const char *filename)
   return e;
 }
 
+void (*pc_srcopen_hook)(const char *name,int found)=NULL;   /* checkpoints: the files a segment reads */
+
 void *pc_opensrc(char *filename)
 {
   SRCCACHE *e=srccache_load(filename);
   SRCFILE *f;
 
+  if (pc_srcopen_hook!=NULL)
+    pc_srcopen_hook(filename,e!=NULL);
   if (e==NULL || (f=(SRCFILE *)calloc(1,sizeof(SRCFILE)))==NULL)
     return NULL;
   f->data=e->data;

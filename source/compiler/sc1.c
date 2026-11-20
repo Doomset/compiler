@@ -731,6 +731,13 @@ int pc_compile(int argc, char *argv[])
     ckpt_load_start();
     parse();
     warnstack_cleanup();
+    if (sc_status==statFIRST) {
+      /* a segment of the first pass: the rest of the first pass's work, the pass state, stop */
+      sc_parsenum++;
+      if (sc_reparse)
+        ckpt_pass_end();        /* a prototype changed: the caller compiles normally */
+      goto first_pass_done;
+    } /* if */
     if (sc_status==statWRITE) {
       writetrailer();
       entry=testsymbols(&glbtab,0,TRUE,FALSE);
@@ -775,12 +782,14 @@ int pc_compile(int argc, char *argv[])
     ckpt_pass_begin();
     preprocess();                       /* fetch first line */
     parse();                            /* process all input */
+    ckpt_pass_finish();
     warnstack_cleanup();
     sc_parsenum++;
 #ifdef PERF_TRACE
     { char msg[64]; sprintf(msg,"first pass #%d done (reparse=%d)",sc_parsenum,sc_reparse); perf_pass(msg); }
 #endif
   } while (sc_reparse);
+first_pass_done:
 
   /* second (or third) pass */
   if (sc_listing)
@@ -875,6 +884,8 @@ int pc_compile(int argc, char *argv[])
         errnum++;
         goto cleanup;
       } /* if */
+      if (seg_load!=NULL && *seg_load!='\0')
+        ckpt_pass_end();        /* a first-pass segment ends with the pass state */
     } /* if */
   } /* if */
 #ifdef PERF_TRACE
@@ -907,6 +918,7 @@ int pc_compile(int argc, char *argv[])
   ckpt_pass_begin();
   preprocess();                         /* fetch first line */
   parse();                              /* process all input */
+  ckpt_pass_finish();
   warnstack_cleanup();
 #ifdef PERF_TRACE
   perf_pass("second pass (code generation)");

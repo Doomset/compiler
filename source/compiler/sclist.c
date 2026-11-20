@@ -653,8 +653,16 @@ SC_FUNC char *get_dbgstring(int index)
   return get_string(&dbgstrings,index);
 }
 
+static int dbg_borrowed=FALSE;  /* the strings point into blocks of dbgstring_append_borrowed() */
+
 SC_FUNC void delete_dbgstringtable(void)
 {
+  if (dbg_borrowed) {
+    free(dbgstrings.data);
+    memset(&dbgstrings,0,sizeof dbgstrings);
+    dbg_borrowed=FALSE;
+    return;
+  } /* if */
   delete_stringtable(&dbgstrings);
   assert(dbgstrings.strings==NULL);
 }
@@ -668,6 +676,29 @@ SC_FUNC int dbgstring_count(void)
 SC_FUNC void dbgstring_append(char *string)
 {
   insert_string(&dbgstrings,string);
+}
+
+/* appends strings the table does not own (the assembler run over segment pieces, scckpt.c: millions of
+ * lines, one block per piece); only valid on a table that holds nothing else */
+SC_FUNC void dbgstring_append_borrowed(char **strs,int n)
+{
+  int offset=(int)(dbgstrings.strings-dbgstrings.data);
+  int need=offset+dbgstrings.length+n;
+  assert(dbg_borrowed || dbgstrings.length==0);
+  dbg_borrowed=TRUE;
+  if (dbgstrings.data==NULL)
+    offset=0;
+  if (need>dbgstrings.size) {
+    int size=(dbgstrings.size*3/2>need) ? dbgstrings.size*3/2 : need;
+    char **data=(char**)realloc(dbgstrings.data,(size_t)size*sizeof(char*));
+    if (data==NULL)
+      error(103);
+    dbgstrings.data=data;
+    dbgstrings.strings=data+offset;
+    dbgstrings.size=size;
+  } /* if */
+  memcpy(&dbgstrings.strings[dbgstrings.length],strs,(size_t)n*sizeof(char*));
+  dbgstrings.length+=n;
 }
 
 static void ck_stringlist(ckio *io,stringlist *list)

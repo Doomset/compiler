@@ -272,10 +272,15 @@ typedef struct {
   int htnext;           /* next symbol in the symbol cache chain */
 } ckrec;
 
-static int cmp_int(const void *a,const void *b)
+/* referrers in a canonical order close to the one the compiler builds (the order its callers come
+ * in the code): by address, then by place in the table; the stack estimate walks them in this order
+ * and its memo works best in source order */
+static int cmp_refsym(const void *a,const void *b)
 {
-  int x=*(const int*)a,y=*(const int*)b;
-  return (x>y)-(x<y);
+  const symbol *x=*(symbol*const*)a,*y=*(symbol*const*)b;
+  if (x->addr!=y->addr)
+    return (x->addr>y->addr) ? 1 : -1;
+  return (x->work>y->work)-(x->work<y->work);
 }
 
 static int symref(symbol *sym)
@@ -363,16 +368,19 @@ static void ck_symbols(ckio *io,symbol **pcurfunc)
        * history and stays out of the file (the referrers only feed the stack estimate); a
        * referrer that is no longer in the table (a deleted operator: a dangling pointer the
        * compiler keeps) is left out */
-      int *refs=(int*)malloc(((size_t)nref+1)*sizeof(int));
+      symbol **rs=(symbol**)malloc(((size_t)nref+1)*sizeof(symbol*));
       int m=0;
-      if (refs==NULL)
+      if (rs==NULL)
         error(103);
       for (k=0; k<sym->numrefers; k++)
         if (sym->refer[k]!=NULL && symref(sym->refer[k])>0)
-          refs[m++]=symref(sym->refer[k]);
-      qsort(refs,(size_t)m,sizeof(int),cmp_int);
-      ck_bytes(io,refs,(size_t)m*sizeof(int));
-      free(refs);
+          rs[m++]=sym->refer[k];
+      qsort(rs,(size_t)m,sizeof(symbol*),cmp_refsym);
+      for (k=0; k<m; k++) {
+        int r=symref(rs[k]);
+        CKV(io,r);
+      } /* for */
+      free(rs);
       sym=sym->next;
     } else {
       rec[i].parent=parent;
@@ -568,8 +576,30 @@ static void ck_text(const char *path)
   fclose(f);
 }
 
+static double ck_wall(void)
+{
+#if defined _WIN32
+  LARGE_INTEGER f,c;
+  QueryPerformanceFrequency(&f);
+  QueryPerformanceCounter(&c);
+  return (double)c.QuadPart/(double)f.QuadPart;
+#else
+  return (double)clock()/CLOCKS_PER_SEC;
+#endif
+}
+
+static int ck_dbg=-1;
+static void ck_timing(const char *what,double t0)
+{
+  if (ck_dbg<0)
+    ck_dbg=(getenv("PAWNCC_CKPT_DEBUG")!=NULL);
+  if (ck_dbg)
+    fprintf(stderr,"[ckpt] %s %.3f s\n",what,ck_wall()-t0);
+}
+
 static int ck_save(const char *path)
 {
+  double t0=ck_wall();
   char tmp[_MAX_PATH+16];
   ckio io;
   int ok;
@@ -591,11 +621,13 @@ static int ck_save(const char *path)
     remove(tmp);
   if (ok && getenv("PAWNCC_CKPT_TEXT")!=NULL)
     ck_text(path);
+  ck_timing("save",t0);
   return ok;
 }
 
 static int ck_load(const char *path)
 {
+  double t0=ck_wall();
   ckio io;
   io.wr=FALSE;
   io.bad=FALSE;
@@ -604,7 +636,83 @@ static int ck_load(const char *path)
   setvbuf(io.f,NULL,_IOFBF,1<<20);
   ck_state(&io);
   fclose(io.f);
+  ck_timing("load",t0);
   return !io.bad;
+}
+
+/* ----- the files a stretch of the pass reads ------------------------------------------------- *
+ * "F <name>" for a file it opened, "D <directory>" for the directory of a name it looked for and did
+ * not find (a new file there could change what an #include finds). A caller compares sizes and
+ * times of these to decide which segments an edit touched. */
+
+static char **ck_files=NULL;
+static int ck_nfiles=0,ck_capfiles=0;
+
+static void ck_file_add(const char *kind,const char *name)
+{
+  char entry[_MAX_PATH+8];
+  int i;
+  if (strlen(name)>_MAX_PATH)
+    return;
+  sprintf(entry,"%s %s",kind,name);
+  for (i=0; i<ck_nfiles; i++)
+    if (strcmp(ck_files[i],entry)==0)
+      return;
+  if (ck_nfiles==ck_capfiles) {
+    int cap=(ck_capfiles==0) ? 64 : 2*ck_capfiles;
+    char **p=(char**)realloc(ck_files,(size_t)cap*sizeof(char*));
+    if (p==NULL)
+      return;
+    ck_files=p;
+    ck_capfiles=cap;
+  } /* if */
+  ck_files[ck_nfiles++]=duplicatestring(entry);
+}
+
+static void ck_srcopen(const char *name,int found)
+{
+  if (found) {
+    ck_file_add("F",name);
+  } else {
+    char dir[_MAX_PATH+1];
+    char *p;
+    strcpy(dir,name);
+    p=strrchr(dir,'\\');
+    if (p==NULL || (strrchr(dir,'/')!=NULL && strrchr(dir,'/')>p))
+      p=strrchr(dir,'/');
+    if (p!=NULL)
+      *p='\0';
+    else
+      strcpy(dir,".");
+    ck_file_add("D",dir);
+  } /* if */
+}
+
+/* the files of the include levels open now: a stretch that starts here goes on reading them */
+static void ck_files_reset(void)
+{
+  int i;
+  for (i=0; i<ck_nfiles; i++)
+    free(ck_files[i]);
+  ck_nfiles=0;
+  for (i=0; i<ckpt_level_count(); i++) {
+    int fnum,line;
+    FILE *h;
+    ckpt_level_get(i,&fnum,&line,&h);
+    if (h!=NULL && pc_srcname(h)!=NULL)
+      ck_file_add("F",pc_srcname(h));
+  } /* for */
+}
+
+static void ck_files_write(const char *path)
+{
+  FILE *f;
+  int i;
+  if ((f=fopen(path,"wb"))==NULL)
+    return;
+  for (i=0; i<ck_nfiles; i++)
+    fprintf(f,"%s\n",ck_files[i]);
+  fclose(f);
 }
 
 /* ----- driving ------------------------------------------------------------------------------- */
@@ -649,6 +757,8 @@ SC_FUNC void ckpt_init(void)
     ck_out=NULL;
   ck_mode=(ck_savedir!=NULL || ck_stop>=0 || ck_out!=NULL) ? 1 : 0;
   ck_last=ck_cputime();
+  if (ck_mode>0)
+    pc_srcopen_hook=ck_srcopen;
 }
 
 SC_FUNC int ckpt_active(void)
@@ -660,6 +770,7 @@ SC_FUNC int ckpt_active(void)
 
 static void ck_write_outputs(void)
 {
+  double t0=ck_wall();
   char name[_MAX_PATH+16];
   FILE *f;
   int i,n;
@@ -685,6 +796,7 @@ static void ck_write_outputs(void)
     } /* for */
     fclose(f);
   } /* if */
+  ck_timing("outputs",t0);
 }
 
 static void ck_write_done(int ok)
@@ -693,6 +805,8 @@ static void ck_write_done(int ok)
   FILE *f;
   if (ck_out==NULL)
     return;
+  sprintf(name,"%s.files",ck_out);
+  ck_files_write(name);
   sprintf(name,"%s.done",ck_out);
   if ((f=fopen(name,"wb"))!=NULL) {
     fprintf(f,"%d %d %d %ld\n",ok,errnum,warnnum,ck_ordinal);
@@ -714,6 +828,18 @@ SC_FUNC void ckpt_pass_begin(void)
   ckpt_init();
   ck_ordinal=0;
   ck_last=ck_cputime();
+  if (ck_mode>0)
+    ck_files_reset();
+}
+
+/* a normal compile that saves checkpoints: the files of the last stretch of the pass */
+SC_FUNC void ckpt_pass_finish(void)
+{
+  char name[_MAX_PATH+64];
+  if (ck_mode<=0 || ck_savedir==NULL)
+    return;
+  sprintf(name,"%s/%d-end.pre.files",ck_savedir,(sc_status==statFIRST) ? 1 : 2);
+  ck_files_write(name);
 }
 
 /* called by parse() before every top-level declaration */
@@ -743,6 +869,9 @@ SC_FUNC void ckpt_boundary(void)
       char name[_MAX_PATH+64];
       FILE *f;
       int pass=(sc_status==statFIRST) ? 1 : 2;
+      sprintf(name,"%s/%d-%ld.pre.files",ck_savedir,pass,ck_ordinal);
+      ck_files_write(name);
+      ck_files_reset();
       sprintf(name,"%s/%d-%ld.ck",ck_savedir,pass,ck_ordinal);
       if (ck_save(name)) {
         sprintf(name,"%s/index.txt",ck_savedir);
@@ -789,6 +918,8 @@ typedef struct {
   cell code_idx,glb_declared;
   int labnum,errnum,warnnum;
   int msg[7];           /* sc5.c: the state of the error messages */
+  int nheap;
+  long *heap;           /* the heap list (sclist.c), as pairs */
   int nlev;
   int lev_f[sCOMP_STACK+64],lev_line[sCOMP_STACK+64];
   size_t lev_pos[sCOMP_STACK+64];
@@ -879,6 +1010,17 @@ static void ck_capture(ckinfo *ci)
   ci->errnum=errnum;
   ci->warnnum=warnnum;
   ckpt_sc5_get(ci->msg);
+  {
+    valuepair *hp;
+    for (hp=heaplist_first(); hp!=NULL; hp=hp->next)
+      ci->nheap++;
+    if ((ci->heap=(long*)malloc(((size_t)ci->nheap+1)*2*sizeof(long)))==NULL)
+      error(103);
+    for (hp=heaplist_first(), i=0; hp!=NULL; hp=hp->next, i++) {
+      ci->heap[2*i]=hp->first;
+      ci->heap[2*i+1]=hp->second;
+    } /* for */
+  }
   ci->nlev=ckpt_level_count();
   if (ci->nlev>(int)arraysize(ci->lev_f))
     ci->nlev=(int)arraysize(ci->lev_f);
@@ -982,6 +1124,37 @@ static void ck_relocate(const ckinfo *a,const ckinfo *b)
   sc_labnum+=b->labnum-a->labnum;
   errnum+=b->errnum-a->errnum;
   warnnum+=b->warnnum-a->warnnum;
+  {
+    /* the heap list: the first pass appends one entry per function, the second pass takes them from
+     * the front; so this state's list either starts with <a>'s (a later first-pass point) or is
+     * the end of it (a later second-pass point) */
+    valuepair *hp;
+    long *cur;
+    int ncur=0,m;
+    for (hp=heaplist_first(); hp!=NULL; hp=hp->next)
+      ncur++;
+    if ((cur=(long*)malloc(((size_t)ncur+1)*2*sizeof(long)))==NULL)
+      error(103);
+    for (hp=heaplist_first(), m=0; hp!=NULL; hp=hp->next, m++) {
+      cur[2*m]=hp->first;
+      cur[2*m+1]=hp->second;
+    } /* for */
+    if (a->nheap!=b->nheap || memcmp(a->heap,b->heap,(size_t)a->nheap*2*sizeof(long))!=0) {
+      if (ncur>=a->nheap && memcmp(cur,a->heap,(size_t)a->nheap*2*sizeof(long))==0) {
+        delete_heaplisttable();
+        for (m=0; m<b->nheap; m++)
+          push_heaplist(b->heap[2*m],b->heap[2*m+1]);
+        for (m=a->nheap; m<ncur; m++)
+          push_heaplist(cur[2*m],cur[2*m+1]);
+      } else if (ncur<=a->nheap && a->nheap==b->nheap
+                 && memcmp(cur,a->heap+2*(a->nheap-ncur),(size_t)ncur*2*sizeof(long))==0) {
+        delete_heaplisttable();
+        for (m=b->nheap-ncur; m<b->nheap; m++)
+          push_heaplist(b->heap[2*m],b->heap[2*m+1]);
+      } /* if */
+    } /* if */
+    free(cur);
+  }
   {
     /* the message state: what segment j left, unless a later message changed it again */
     int v[7],m;
@@ -1154,6 +1327,7 @@ SC_FUNC int ckpt_load_start(void)
   ck_dbgstart=dbgstring_count();
   ckpt_init();
   ck_skip_next=1;
+  ck_files_reset();
   if (getenv("PAWNCC_CKPT_RESAVE")!=NULL) {
     /* test: a loaded checkpoint saved again must give the same file */
     exit(ck_save(getenv("PAWNCC_CKPT_RESAVE")) ? 0 : 3);
@@ -1213,18 +1387,55 @@ SC_FUNC int ckpt_assemble_input(void)
     setvbuf(f,NULL,_IOFBF,1<<20);
     p=strrchr(path,'.');
     if (p!=NULL && strcmp(p,".dbg")==0) {
-      while (fgets(line,sizeof line,f)!=NULL) {
-        n=strlen(line);
-        while (n>0 && (line[n-1]=='\n' || line[n-1]=='\r'))
-          line[--n]='\0';
-        dbgstring_append(line);
-      } /* while */
+      /* one block per piece, the lines split in place (the table borrows them) */
+      long size;
+      char *buf,*q,*end,**strs;
+      int count=0,cap=1024;
+      fseek(f,0,SEEK_END);
+      size=ftell(f);
+      fseek(f,0,SEEK_SET);
+      if ((buf=(char*)malloc((size_t)size+1))==NULL || (strs=(char**)malloc((size_t)cap*sizeof(char*)))==NULL)
+        error(103);
+      if (fread(buf,1,(size_t)size,f)!=(size_t)size) {
+        pc_printf("[ckpt] cannot read %s\n",path);
+        exit(4);
+      } /* if */
+      buf[size]='\0';
+      for (q=buf, end=buf+size; q<end; ) {
+        char *nlp=(char*)memchr(q,'\n',(size_t)(end-q));
+        char *e=(nlp!=NULL) ? nlp : end;
+        char *t=e;
+        while (t>q && t[-1]=='\r')
+          t--;
+        *t='\0';
+        if (count==cap) {
+          cap*=2;
+          if ((strs=(char**)realloc(strs,(size_t)cap*sizeof(char*)))==NULL)
+            error(103);
+        } /* if */
+        strs[count++]=q;
+        q=(nlp!=NULL) ? nlp+1 : end;
+      } /* for */
+      dbgstring_append_borrowed(strs,count);
+      free(strs);           /* buf stays: the table points into it */
     } else {
-      size_t got;
-      while ((got=fread(line,1,sizeof line-1,f))>0) {
-        line[got]='\0';
-        pc_writeasm(outf,line);
-      } /* while */
+      /* the whole piece in one write */
+      long size;
+      char *buf;
+      fseek(f,0,SEEK_END);
+      size=ftell(f);
+      fseek(f,0,SEEK_SET);
+      if (size>0) {
+        if ((buf=(char*)malloc((size_t)size+1))==NULL)
+          error(103);
+        if (fread(buf,1,(size_t)size,f)!=(size_t)size) {
+          pc_printf("[ckpt] cannot read %s\n",path);
+          exit(4);
+        } /* if */
+        buf[size]='\0';
+        pc_writeasm(outf,buf);
+        free(buf);
+      } /* if */
     } /* if */
     fclose(f);
   } /* while */

@@ -776,3 +776,14 @@ SC_FUNC void ckpt_visit_sc5(ckio *io)
     } /* for */
   } /* if */
 }
+
+/* the message state, for relocating a checkpoint (scckpt.c) */
+SC_FUNC void ckpt_sc5_get(int v[7])
+{
+  v[0]=errflag; v[1]=errstart; v[2]=errline; v[3]=errwarn; v[4]=lastline; v[5]=errorcount; v[6]=lastfile;
+}
+
+SC_FUNC void ckpt_sc5_set(const int v[7])
+{
+  errflag=v[0]; errstart=v[1]; errline=v[2]; errwarn=v[3]; lastline=v[4]; errorcount=v[5]; lastfile=(short)v[6];
+}

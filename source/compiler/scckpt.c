@@ -788,6 +788,7 @@ typedef struct {
 typedef struct {
   cell code_idx,glb_declared;
   int labnum,errnum,warnnum;
+  int msg[7];           /* sc5.c: the state of the error messages */
   int nlev;
   int lev_f[sCOMP_STACK+64],lev_line[sCOMP_STACK+64];
   size_t lev_pos[sCOMP_STACK+64];
@@ -877,6 +878,7 @@ static void ck_capture(ckinfo *ci)
   ci->labnum=sc_labnum;
   ci->errnum=errnum;
   ci->warnnum=warnnum;
+  ckpt_sc5_get(ci->msg);
   ci->nlev=ckpt_level_count();
   if (ci->nlev>(int)arraysize(ci->lev_f))
     ci->nlev=(int)arraysize(ci->lev_f);
@@ -980,6 +982,15 @@ static void ck_relocate(const ckinfo *a,const ckinfo *b)
   sc_labnum+=b->labnum-a->labnum;
   errnum+=b->errnum-a->errnum;
   warnnum+=b->warnnum-a->warnnum;
+  {
+    /* the message state: what segment j left, unless a later message changed it again */
+    int v[7],m;
+    ckpt_sc5_get(v);
+    for (m=0; m<7; m++)
+      if (v[m]==a->msg[m])
+        v[m]=b->msg[m];
+    ckpt_sc5_set(v);
+  }
 
   /* include levels: a file whose position at the boundary moved */
   for (i=0; i<ckpt_level_count(); i++) {

@@ -980,6 +980,8 @@ SC_FUNC void ckpt_level_setline(int i,int line);
 SC_FUNC void ckpt_visit_sc3(ckio *io);
 SC_FUNC void ckpt_visit_sc4(ckio *io);
 SC_FUNC void ckpt_visit_sc5(ckio *io);
+SC_FUNC void ckpt_sc5_get(int v[7]);
+SC_FUNC void ckpt_sc5_set(const int v[7]);
 SC_FUNC int ckpt_sc7_idle(void);
 SC_FUNC void ckpt_visit_sclist(ckio *io);
 SC_FUNC int ckpt_lexer_idle(void);

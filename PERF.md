@@ -249,6 +249,37 @@ AMX as round 12.
 Found on the way: a Cyrillic file name without its extension (`#include "mod/ёлка"`) is not found in any
 version; the gamemode always writes `.inc`.
 
+## Round 15: both passes in segments from checkpoints (scckpt.c)
+
+A checkpoint is the complete compiler state at a top-level declaration boundary, written in a
+canonical form (equal states give equal files). A segment is a process that loads checkpoint k and
+runs to boundary k+1 (`PAWNCC_SEG_LOAD`, `PAWNCC_SEG_STOP`, `PAWNCC_SEG_OUT`); it writes its end
+state, its assembler text and debug strings, and the files it read (`F name`) or looked for and did not
+find (`M name`). Pieces belong together when every end state equals the next start byte for byte;
+`PAWNCC_ASM_FROM` assembles the AMX from the final state and the pieces.
+
+An edit upstream moves what follows it (code and data addresses, labels, line numbers, usage, referrers,
+messages): `PAWNCC_SEG_RELOC_A/_B` relocate a later start by the difference between the old start and
+the new end of the edited segment. Symbols are matched by name, kind, class, file, parent (enum fields
+of two enums share names) and their number among equal keys counted from the back of the list. The
+build time is not part of a checkpoint (`now` stays the process's, `__timestamp` is written as 0).
+
+The driver is `tools/pawn_segments.py` of the gamemode. Gamemode, LTCG + PGO, 10 segments a pass:
+
+| Case | Before (round 14, speculative) | Segments |
+|---|---:|---:|
+| file saved unchanged | 4.3 s | 1.9 s |
+| edit inside a function body | 4.3 s | ~3.7 s (2 rounds 2.6 s + assembly 1.0 s) |
+| new declaration | ~7 s | ~7.5 s (normal compile started next to the segments) |
+
+AMX byte-identical to a normal compile in every case (`MODS_SEG_VERIFY=1`, `tools/test_pawn_segments.py`).
+Costs that remain: a relocated segment loads three checkpoints (~0.27 s) and saves its start for the
+chain check; the assembly from pieces (1.0 s) is on the critical path; a declaration added or removed
+shifts the boundary ordinals, so the chain cannot close and the normal compile is used.
+
+PGO training for this round: the scenarios of `tools/test_pawn_segments.py` (normal compile with
+checkpoints, segments, relocation, assembly from pieces) with the instrumented build.
+
 ## Round 14: the assembler's label pass on parallel chunks
 
 The assembler already parsed the intermediate text once (the code and data passes replay the records of

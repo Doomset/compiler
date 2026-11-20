@@ -2829,3 +2829,21 @@ static int constant(value *lval)
   return TRUE;                  /* yes, it was a constant value */
 }
 
+/* ----- checkpoints (scckpt.c) ------------------------------------------------------------ */
+SC_FUNC void ckpt_visit_sc3(ckio *io)
+{
+  {
+    char *name=ck_writing(io) ? lastsymbol : NULL;
+    ck_str(io,&name);
+    if (!ck_writing(io)) {
+      lastsymbol[0]='\0';
+      if (name!=NULL && strlen(name)<sizeof lastsymbol)
+        strcpy(lastsymbol,name);
+      free(name);
+    } /* if */
+  }
+  CKV(io,bitwise_opercount);
+  CKV(io,decl_heap);
+  CKV(io,lval_stgidx);
+  CKV(io,lval_cidx);
+}

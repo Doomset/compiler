@@ -658,3 +658,125 @@ SC_FUNC void delete_dbgstringtable(void)
   delete_stringtable(&dbgstrings);
   assert(dbgstrings.strings==NULL);
 }
+
+/* ----- checkpoints (scckpt.c) ------------------------------------------------------------ */
+SC_FUNC int dbgstring_count(void)
+{
+  return dbgstrings.length;
+}
+
+SC_FUNC void dbgstring_append(char *string)
+{
+  insert_string(&dbgstrings,string);
+}
+
+static void ck_stringlist(ckio *io,stringlist *list)
+{
+  int n=ck_count(io,list->length),i;
+  if (ck_writing(io)) {
+    for (i=0; i<n; i++)
+      ck_str(io,&list->strings[i]);
+  } else {
+    delete_stringtable(list);
+    for (i=0; i<n; i++) {
+      char *str=NULL;
+      ck_str(io,&str);
+      if (str==NULL) {
+        ck_fail(io);
+        break;
+      } /* if */
+      insert_string(list,str);
+      free(str);
+    } /* for */
+  } /* if */
+}
+
+/* a sorted list of string pairs; "tail" appends in the saved (sorted) order */
+static void ck_pairlist(ckio *io,stringpair *root)
+{
+  stringpair *cur,*tail;
+  int n=0,i;
+  if (ck_writing(io))
+    for (cur=root->next; cur!=NULL; cur=cur->next)
+      n++;
+  n=ck_count(io,n);
+  if (ck_writing(io)) {
+    for (cur=root->next; cur!=NULL; cur=cur->next) {
+      ck_str(io,&cur->first);
+      ck_str(io,&cur->second);
+      CKV(io,cur->matchlength);
+    } /* for */
+  } else {
+    delete_stringpairtable(root);
+    tail=root;
+    for (i=0; i<n; i++) {
+      if ((cur=(stringpair*)calloc(1,sizeof(stringpair)))==NULL)
+        error(103);
+      ck_str(io,&cur->first);
+      ck_str(io,&cur->second);
+      CKV(io,cur->matchlength);
+      if (cur->first==NULL || cur->second==NULL) {
+        free(cur->first);
+        free(cur->second);
+        free(cur);
+        ck_fail(io);
+        break;
+      } /* if */
+      tail->next=cur;
+      tail=cur;
+    } /* for */
+  } /* if */
+}
+
+SC_FUNC void ckpt_visit_sclist(ckio *io)
+{
+  valuepair *hp;
+  int n=0,i;
+
+  ck_pairlist(io,&alias_tab);
+  #if !defined NO_DEFINE
+    ck_pairlist(io,&substpair);
+    if (!ck_writing(io)) {
+      stringpair *cur;
+      for (i=0; i<arraysize(substindex); i++)
+        substindex[i]=NULL;
+      subst_map_drop();
+      subst_map_off=FALSE;
+      for (cur=substpair.next; cur!=NULL; cur=cur->next) {
+        int k=(int)cur->first[0]-PUBLIC_CHAR;
+        if (k>=0 && k<arraysize(substindex) && substindex[k]==NULL)
+          substindex[k]=cur;
+        subst_map_put(cur);
+      } /* for */
+    } /* if */
+  #endif
+  ck_stringlist(io,&sourcefiles);
+  ck_stringlist(io,&autolist);
+  #if !defined SC_LIGHT
+    if (docstrings.length!=0)
+      ck_fail(io);              /* documentation is not kept */
+  #endif
+  if (ck_writing(io))
+    for (hp=heaplist.next; hp!=NULL; hp=hp->next)
+      n++;
+  n=ck_count(io,n);
+  if (ck_writing(io)) {
+    for (hp=heaplist.next; hp!=NULL; hp=hp->next) {
+      CKV(io,hp->first);
+      CKV(io,hp->second);
+    } /* for */
+  } else {
+    valuepair *tail=&heaplist;
+    delete_heaplisttable();
+    for (i=0; i<n; i++) {
+      valuepair *cur;
+      if ((cur=(valuepair*)malloc(sizeof(valuepair)))==NULL)
+        error(103);
+      CKV(io,cur->first);
+      CKV(io,cur->second);
+      cur->next=NULL;
+      tail->next=cur;
+      tail=cur;
+    } /* for */
+  } /* if */
+}

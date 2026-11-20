@@ -229,6 +229,8 @@ static int errflag;
 static int errstart;    /* line number at which the instruction started */
 static int errline;     /* forced line number for the error message */
 static int errwarn;
+static int lastline,errorcount;   /* error(): repeated errors on one line */
+static short lastfile;
 
 /*  error
  *
@@ -245,8 +247,6 @@ static int errwarn;
 SC_FUNC int error(long number,...)
 {
   static char *prefix[3]={ "error", "fatal error", "warning" };
-  static int lastline,errorcount;
-  static short lastfile;
   char *msg,*pre;
   va_list argptr;
   char string[128];
@@ -738,4 +738,41 @@ SC_FUNC int error_suggest(int number,const char *name,const char *name2,int type
     error(makelong(number,1),name,closest_name);
   } /* if */
   return 0;
+}
+
+/* ----- checkpoints (scckpt.c) ------------------------------------------------------------ */
+SC_FUNC void ckpt_visit_sc5(ckio *io)
+{
+  struct s_warnstack *w;
+  int depth=0,i;
+  CKV(io,errflag);
+  CKV(io,errstart);
+  CKV(io,errline);
+  CKV(io,errwarn);
+  CKV(io,lastline);
+  CKV(io,errorcount);
+  CKV(io,lastfile);
+  if (ck_writing(io))
+    for (w=warnstack.next; w!=NULL; w=w->next)
+      depth++;
+  depth=ck_count(io,depth);
+  CKV(io,warnstack.disable);
+  if (ck_writing(io)) {
+    for (w=warnstack.next; w!=NULL; w=w->next)
+      CKV(io,w->disable);
+  } else {
+    struct s_warnstack **link=&warnstack.next;
+    while (warnstack.next!=NULL) {
+      w=warnstack.next;
+      warnstack.next=w->next;
+      free(w);
+    } /* while */
+    for (i=0; i<depth; i++) {
+      if ((w=(struct s_warnstack*)calloc(1,sizeof(struct s_warnstack)))==NULL)
+        error(103);
+      CKV(io,w->disable);
+      *link=w;
+      link=&w->next;
+    } /* for */
+  } /* if */
 }

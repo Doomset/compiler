@@ -1414,3 +1414,9 @@ SC_FUNC void outinstr(const char *name,emit_outval params[],int numparams)
 
   code_idx+=opcodes(1)+opargs(numparams);
 }
+
+/* ----- checkpoints (scckpt.c) ------------------------------------------------------------ */
+SC_FUNC void ckpt_visit_sc4(ckio *io)
+{
+  CKV(io,fcurseg);
+}

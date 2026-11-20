@@ -735,6 +735,28 @@ int pc_eofsrc(void *handle)
   return ((SRCFILE *)handle)->eof;
 }
 
+/* for the checkpoints (scckpt.c): the name a read handle was opened with, and its position */
+const char *pc_srcname(void *handle)
+{
+  SRCFILE *f=(SRCFILE *)handle;
+  return (f!=NULL && f->cache!=NULL) ? f->cache->name : NULL;
+}
+
+size_t pc_srcpos(void *handle,int *eof)
+{
+  SRCFILE *f=(SRCFILE *)handle;
+  if (eof!=NULL)
+    *eof=f->eof;
+  return f->pos;
+}
+
+void pc_srcsetpos(void *handle,size_t pos,int eof)
+{
+  SRCFILE *f=(SRCFILE *)handle;
+  f->pos=(pos<=f->size) ? pos : f->size;
+  f->eof=eof;
+}
+
 /* should return a pointer, which is used as a "magic cookie" to all I/O
  * functions; return NULL for failure
  */

@@ -585,6 +585,7 @@ int pc_compile(int argc, char *argv[])
   void *inpfmark;
   int lcl_packstr,lcl_needsemicolon,lcl_tabsize;
   char *pass_load=NULL,*pass_save=NULL;   /* scpass.c */
+  char *seg_load=NULL,*asm_from=NULL;     /* scckpt.c */
   #if !defined SC_LIGHT
     int hdrsize=0;
   #endif
@@ -709,6 +710,36 @@ int pc_compile(int argc, char *argv[])
     pass_load=NULL;
   if (pass_save!=NULL && *pass_save=='\0')
     pass_save=NULL;
+  /* PAWNCC_SEG_LOAD / PAWNCC_ASM_FROM: a segment of a pass from a checkpoint, or the assembler
+   * run over the pieces of the segments (scckpt.c) */
+  ckpt_init();
+  seg_load=getenv("PAWNCC_SEG_LOAD");
+  asm_from=getenv("PAWNCC_ASM_FROM");
+  if ((seg_load!=NULL && *seg_load!='\0') || (asm_from!=NULL && *asm_from!='\0')) {
+    #if !defined NO_DEFINE
+      delete_substtable();
+    #endif
+    resetglobals();
+    errorset(sRESET,0);
+    lexinit();
+    warnstack_init();
+    sc_status=statWRITE;
+    if (asm_from!=NULL && *asm_from!='\0') {
+      ckpt_assemble_input();
+      goto cleanup;
+    } /* if */
+    ckpt_load_start();
+    parse();
+    warnstack_cleanup();
+    if (sc_status==statWRITE) {
+      writetrailer();
+      entry=testsymbols(&glbtab,0,TRUE,FALSE);
+      if (!entry)
+        error(13);              /* no entry point (no public functions) */
+    } /* if */
+    ckpt_pass_end();            /* does not return when the segment writes its pieces */
+    goto cleanup;
+  } /* if */
   if (pass_load==NULL) do {
     /* reset "defined" flag of all functions and global variables */
     reduce_referrers(&glbtab);
@@ -741,6 +772,7 @@ int pc_compile(int argc, char *argv[])
       } /* if */
     } /* if */
     warnstack_init();
+    ckpt_pass_begin();
     preprocess();                       /* fetch first line */
     parse();                            /* process all input */
     warnstack_cleanup();
@@ -822,8 +854,28 @@ int pc_compile(int argc, char *argv[])
       goto cleanup;
     } /* if */
   } else if (pass_save!=NULL) {
-    if (!pass_state_save(pass_save))
+    if (!pass_state_save(pass_save)) {
       pc_printf("[pass] state not saved to %s\n",pass_save);
+    } else if (ckpt_active()) {
+      /* checkpoints: the second pass starts from the state just saved, loaded into the startup
+       * tables, as a speculative second pass does; so the checkpoints of either kind of compile
+       * fit the segments of the other (scckpt.c) */
+      int status=sc_status;
+      while (glbtab.next!=NULL)
+        delete_symbol(&glbtab,glbtab.next);
+      line_sym=NULL;
+      delete_consttable(&tagname_tab);
+      delete_aliastable();      /* the first pass's native aliases: the second pass makes them again */
+      sc_parsenum=0;
+      sc_status=statIDLE;
+      setconstants();
+      sc_status=status;
+      if (!pass_state_load(pass_save)) {
+        pc_printf("[pass] cannot load %s\n",pass_save);
+        errnum++;
+        goto cleanup;
+      } /* if */
+    } /* if */
   } /* if */
 #ifdef PERF_TRACE
   perf_pass("pass state load/save");
@@ -852,6 +904,7 @@ int pc_compile(int argc, char *argv[])
       plungequalifiedfile(incfname,1);    /* parse implicit include file (again) */
   } /* if */
   warnstack_init();
+  ckpt_pass_begin();
   preprocess();                         /* fetch first line */
   parse();                              /* process all input */
   warnstack_cleanup();
@@ -1896,6 +1949,8 @@ static void parse(void)
   char *str;
 
   while (freading){
+    if (ckpt_active())
+      ckpt_boundary();   /* a checkpoint may be saved here, or a segment end (scckpt.c) */
     /* first try whether a declaration possibly is native or public */
     tok=lex(&val,&str);  /* read in (new) token */
     switch (tok) {
@@ -9071,4 +9126,27 @@ SC_FUNC cell do_static_check(int use_warning)
   } /* if */
   needtoken(')');
   return !!val;
+}
+
+/* ----- checkpoints (scckpt.c) ------------------------------------------------------------ */
+SC_FUNC void ckpt_visit_sc1(ckio *io)
+{
+  int wqi=ck_writing(io) ? (int)(wqptr-wq) : 0;
+  CKV(io,lastst);
+  CKV(io,endlessloop);
+  CKV(io,rettype);
+  CKV(io,skipinput);
+  CKV(io,sc_reparse);
+  CKV(io,sc_parsenum);
+  CKV(io,wqi);
+  if (wqi<0 || wqi>wqTABSZ) {
+    ck_fail(io);
+    wqi=0;
+  } /* if */
+  ck_bytes(io,wq,(size_t)wqi*sizeof(int));  /* only the live part: the rest is history */
+  if (!ck_writing(io)) {
+    memset(wq+wqi,0,(size_t)(wqTABSZ-wqi)*sizeof(int));
+    wqptr=wq+wqi;
+  } /* if */
+  CKV(io,now);
 }

@@ -91,6 +91,7 @@ set(PAWNC_SRCS
   sclist.c
   scmemfil.c
   scpass.c
+  scckpt.c
   scstate.c
   scvars.c
   version.h)

@@ -961,6 +961,34 @@ SC_FUNC valuepair *heaplist_first(void);
 /* function prototypes in SCPASS.C */
 SC_FUNC int pass_state_save(const char *path);
 SC_FUNC int pass_state_load(const char *path);
+/* function prototypes in SCCKPT.C: checkpoints of a pass between top-level declarations */
+typedef struct s_ckio ckio;
+SC_FUNC void ck_bytes(ckio *io,void *p,size_t n);
+#define CKV(io,v)  ck_bytes((io),&(v),sizeof(v))
+SC_FUNC int ck_writing(ckio *io);
+SC_FUNC int ck_count(ckio *io,int n);
+SC_FUNC void ck_str(ckio *io,char **s);
+SC_FUNC void ck_fail(ckio *io);
+SC_FUNC void ck_libref(ckio *io,constvalue **lib);
+SC_FUNC void ckpt_visit_sc1(ckio *io);
+SC_FUNC void ckpt_visit_sc2(ckio *io);
+SC_FUNC void ckpt_glbtab_link(symbol **made,int count,const int *htnext);
+SC_FUNC void ckpt_visit_sc3(ckio *io);
+SC_FUNC void ckpt_visit_sc4(ckio *io);
+SC_FUNC void ckpt_visit_sc5(ckio *io);
+SC_FUNC int ckpt_sc7_idle(void);
+SC_FUNC void ckpt_visit_sclist(ckio *io);
+SC_FUNC int ckpt_lexer_idle(void);
+SC_FUNC int dbgstring_count(void);
+SC_FUNC void dbgstring_append(char *string);
+SC_FUNC void ckpt_init(void);
+SC_FUNC void ckpt_boundary(void);
+SC_FUNC void ckpt_pass_begin(void);
+SC_FUNC int ckpt_active(void);
+SC_FUNC int ckpt_load_start(void);
+SC_FUNC void ckpt_pass_end(void);
+SC_FUNC int ckpt_assemble_input(void);
+extern long ckpt_read_bytes;      /* source bytes read so far (readline) */
 SC_FUNC int state_list_get(int index,const int **states,int *numstates,int *fsa,int *listid);
 SC_FUNC void state_list_append(const int *states,int numstates,int fsa,int listid);
 SC_FUNC stringlist *insert_dbgfile(const char *filename);
@@ -993,6 +1021,9 @@ SC_FUNC cell cp_translate(const unsigned char *string,const unsigned char **endp
 SC_FUNC cell get_utf8_char(const unsigned char *string,const unsigned char **endptr);
 SC_FUNC int scan_utf8(FILE *fp,const char *filename);
 int pc_srcutf8_get(void *handle,int *utf8,int *bom);
+const char *pc_srcname(void *handle);
+size_t pc_srcpos(void *handle,int *eof);
+void pc_srcsetpos(void *handle,size_t pos,int eof);
 void pc_srcutf8_set(void *handle,int utf8,int bom);
 
 /* function prototypes in SCSTATE.C */

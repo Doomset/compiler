@@ -1825,3 +1825,9 @@ static void stgopt(char *start,char *end,int (*outputfunc)(char *str))
   for (start=debut; start<end; start+=strlen(start)+1)
     outputfunc(start);
 }
+
+/* ----- checkpoints (scckpt.c) ------------------------------------------------------------ */
+SC_FUNC int ckpt_sc7_idle(void)
+{
+  return stgidx==0 && pipeidx==0 && !staging;
+}

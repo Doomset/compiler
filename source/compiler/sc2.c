@@ -511,6 +511,7 @@ static void readline(unsigned char *line)
           *ptr='\0';    /* erase '\n' (and any trailing whitespace) */
         } /* if */
       } /* if */
+      ckpt_read_bytes+=(long)strlen((char*)line);
       num-=strlen((char*)line);
       line+=strlen((char*)line);
     } /* if */
@@ -546,6 +547,10 @@ static void readline(unsigned char *line)
  *  was no explicit line continuation, merely an implicit string one.
  *
  */
+#if !defined SC_LIGHT
+static int prev_singleline=FALSE;   /* stripcomment(): the previous line had a single-line doc comment */
+#endif
+
 /* Characters with no meaning to stripcomment() outside comments, strings and the raw-string directives:
  * a run of them only clears "rawmode" (every character but '!' does). */
 static unsigned char strip_plain[256];
@@ -573,7 +578,6 @@ static int stripcomment(unsigned char *line)
     char comment[COMMENT_LIMIT+COMMENT_MARGIN];
     int commentidx=0;
     int skipstar=TRUE;
-    static int prev_singleline=FALSE;
     int singleline=prev_singleline;
 
     prev_singleline=FALSE;  /* preset */
@@ -4211,4 +4215,185 @@ SC_FUNC char *itoh(ucell val)
     *ptr-- = hex[val&(ucell)0x0f];
   } while ((val>>=4)!=0);
   return ptr+1;
+}
+
+/* ----- checkpoints (scckpt.c) ------------------------------------------------------------ */
+
+#define CK_FRAME 9      /* items plungequalifiedfile() pushes for one include level */
+
+/* no token pushed back and nothing but include levels on the stack */
+SC_FUNC int ckpt_lexer_idle(void)
+{
+  return !_pushed && (stkidx%CK_FRAME)==0 && lptr!=term_expr && !SKIPPING;
+}
+
+static void ck_srchandle(ckio *io,FILE **h)
+{
+  int has=0,eof=0;
+  size_t pos=0;
+  char *name=NULL;
+  if (ck_writing(io)) {
+    has=(*h!=NULL);
+    CKV(io,has);
+    if (has) {
+      name=(char*)pc_srcname(*h);
+      pos=pc_srcpos(*h,&eof);
+      ck_str(io,&name);
+      CKV(io,pos);
+      CKV(io,eof);
+    } /* if */
+  } else {
+    CKV(io,has);
+    *h=NULL;
+    if (has) {
+      ck_str(io,&name);
+      CKV(io,pos);
+      CKV(io,eof);
+      if (name==NULL || (*h=(FILE*)pc_opensrc(name))==NULL)
+        ck_fail(io);
+      else
+        pc_srcsetpos(*h,pos,eof);
+      free(name);
+    } /* if */
+  } /* if */
+}
+
+/* puts the global table back in the saved list order; htnext[i] is the 1-based number of the next symbol in
+ * the symbol cache chain of made[i] (0: none) */
+SC_FUNC void ckpt_glbtab_link(symbol **made,int count,const int *htnext)
+{
+  symbol *prev=&glbtab,*last=NULL;
+  char *isnext;
+  int i,n=0;
+  glb_anchors=0;
+  glb_inserts=0;
+  /* glb_unsorted_max is history (the largest name rename_symbol() ever gave); what the index needs is a
+   * name that no out-of-order node exceeds: the running maximum at the last node that is smaller than a
+   * node in front of it */
+  glb_unsorted_set=0;
+  glb_unsorted_max[0]='\0';
+  {
+    const char *runmax=NULL;
+    for (i=0; i<count; i++) {
+      if (runmax!=NULL && strcmp(made[i]->name,runmax)<0) {
+        if (!glb_unsorted_set || strcmp(runmax,glb_unsorted_max)>0)
+          strcpy(glb_unsorted_max,runmax);
+        glb_unsorted_set=1;
+      } /* if */
+      if (runmax==NULL || strcmp(made[i]->name,runmax)>0)
+        runmax=made[i]->name;
+    } /* for */
+  }
+  if ((isnext=(char*)calloc((size_t)count+1,1))==NULL)
+    error(103);
+  for (i=0; i<count; i++) {
+    prev->next=made[i];
+    made[i]->next=NULL;
+    made[i]->is_anchor=0;
+    made[i]->htnext=(htnext[i]>0 && htnext[i]<=count) ? made[htnext[i]-1] : NULL;
+    if (htnext[i]>0 && htnext[i]<=count)
+      isnext[htnext[i]-1]=1;
+    prev=made[i];
+  } /* for */
+  for (i=0; i<count; i++) {
+    if (made[i]->vclass==sGLOBAL && !isnext[i]) {
+      symbol *sym=made[i];
+      if (hashtable_insert(&symbol_cache_ht,namehash(sym->name),&sym)==0)
+        error(103);
+    } /* if */
+  } /* for */
+  free(isnext);
+  /* the anchors: names in sorted order and above the largest renamed name */
+  for (i=0; i<count; i++) {
+    symbol *sym=made[i];
+    if (glb_unsorted_set && strcmp(sym->name,glb_unsorted_max)<=0)
+      continue;
+    if (last!=NULL && strcmp(sym->name,last->name)<0)
+      continue;
+    last=sym;
+    if (++n%ANCHOR_EVERY==0)
+      anchor_add(sym);
+  } /* for */
+  glb_inserts=(unsigned long)n;
+}
+
+SC_FUNC void ckpt_visit_sc2(ckio *io)
+{
+  int writing=ck_writing(io);
+  int nframes,i,j,lpos;
+  long len;
+
+
+  CKV(io,icomment);
+  CKV(io,imlstring);
+  CKV(io,iflevel);
+  if (iflevel<0 || iflevel>sCOMP_STACK) {
+    ck_fail(io);
+    iflevel=0;
+  } /* if */
+  ck_bytes(io,ifstack,(size_t)iflevel);   /* the levels above are history */
+  if (!writing)
+    memset(ifstack+iflevel,0,(size_t)(sCOMP_STACK-iflevel));
+  CKV(io,skiplevel);
+  CKV(io,listline);
+  CKV(io,iskipwspace);
+  CKV(io,_pushed);
+  CKV(io,_lextok);
+  CKV(io,_lexval);
+  CKV(io,_lexnewline);
+  len=writing ? (long)strlen(_lexstr) : 0;
+  CKV(io,len);
+  if (len<0 || len>sLINEMAX)
+    ck_fail(io);
+  else
+    ck_bytes(io,_lexstr,(size_t)len+1);
+#if !defined SC_LIGHT
+  CKV(io,prev_singleline);
+#endif
+  /* the current line (after the macro substitution) and the position in it */
+  len=writing ? (long)strlen((char*)pline) : 0;
+  CKV(io,len);
+  if (len<0 || len>sLINEMAX)
+    ck_fail(io);
+  else
+    ck_bytes(io,pline,(size_t)len+1);
+  lpos=writing ? (int)(lptr-pline) : 0;
+  CKV(io,lpos);
+  if (!writing)
+    lptr=(lpos>=0 && lpos<=len) ? pline+lpos : pline+len;
+
+  /* the include levels, oldest first */
+  nframes=ck_count(io,stkidx/CK_FRAME);
+  if (!writing)
+    stkidx=0;
+  for (i=0; i<nframes; i++) {
+    FILE *h=NULL;
+    char *name=NULL;
+    constvalue *lib=NULL;
+    int v[CK_FRAME-3];
+    if (writing) {
+      stkitem *fr=&stack[i*CK_FRAME];
+      h=(FILE*)fr[0].pv;
+      name=(char*)fr[1].pv;
+      lib=(constvalue*)fr[2].pv;
+      for (j=0; j<CK_FRAME-3; j++)
+        v[j]=fr[3+j].i;
+    } /* if */
+    ck_srchandle(io,&h);
+    ck_str(io,&name);
+    ck_libref(io,&lib);
+    ck_bytes(io,v,sizeof v);
+    if (!writing) {
+      PUSHSTK_P(h);
+      PUSHSTK_P(name);
+      PUSHSTK_P(lib);
+      for (j=0; j<CK_FRAME-3; j++)
+        PUSHSTK_I(v[j]);
+    } /* if */
+  } /* for */
+  /* the file read now */
+  ck_srchandle(io,&inpf);
+  ck_str(io,&inpfname);
+  if (!writing)
+    inpf_org=(nframes>0) ? (FILE*)stack[0].pv : inpf;
 }

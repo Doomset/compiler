@@ -746,6 +746,14 @@ const char *pc_srcname(void *handle)
   return (f!=NULL && f->cache!=NULL) ? f->cache->name : NULL;
 }
 
+/* the whole text of a read handle (the boundary keys of the checkpoints look around the position) */
+const unsigned char *pc_srcdata(void *handle,size_t *size)
+{
+  SRCFILE *f=(SRCFILE *)handle;
+  *size=(f!=NULL) ? f->size : 0;
+  return (f!=NULL) ? (const unsigned char *)f->data : NULL;
+}
+
 size_t pc_srcpos(void *handle,int *eof)
 {
   SRCFILE *f=(SRCFILE *)handle;

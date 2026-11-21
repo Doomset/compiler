@@ -22,8 +22,20 @@
  *    PAWNCC_CKPT_EVERY=<ms>     ... one per <ms> of processor time of the pass (default 150)
  *    PAWNCC_SEG_LOAD=<file>     start from a checkpoint instead of the top of the source
  *    PAWNCC_SEG_STOP=<ordinal>  stop at that boundary (without it: run to the end of the pass)
+ *    PAWNCC_SEG_STOP_AT=<key>   stop at the boundary with that place in the source (see ck_where:
+ *                               the file, and the text around the boundary, so that an edit
+ *                               before it - a declaration added - does not move the stop)
+ *    PAWNCC_SEG_RELOC_A/_B      relocate the loaded start by the difference of two states (below);
+ *                               symbols that <b> has and <a> has not are moved in, those that only
+ *                               <a> has are dropped
+ *    PAWNCC_PASS2_START=<file>  save the state at the start of the second pass there and end (a
+ *                               first-pass segment that ends the pass goes on to that point);
+ *                               PAWNCC_CKPT_SAVE keeps it as "<dir>/2-start.ck"
+ *    PAWNCC_KEYS_DUMP=<file>    append "<pass> <ordinal> <place key>" for every boundary (a check
+ *                               that the keys of a source do not repeat)
  *    PAWNCC_SEG_OUT=<prefix>    the segment writes <prefix>.end.ck, <prefix>.asm, <prefix>.dbg
- *                               and <prefix>.done ("errors warnings ordinal")
+ *                               and <prefix>.done ("ok errors warnings ordinal", then the key of
+ *                               the boundary it stopped at)
  *    PAWNCC_ASM_FROM=<list>     assemble: the first line names the final state, every further
  *                               line an .asm or .dbg piece, in order
  */
@@ -37,7 +49,7 @@
 #endif
 #include "sc.h"
 
-#define CK_MAGIC    "PAWNCKPT3"
+#define CK_MAGIC    "PAWNCKPT5"
 #define CK_END      0x434b454eL   /* "CKEN" */
 
 long ckpt_read_bytes=0;
@@ -48,12 +60,21 @@ struct s_ckio {
   int bad;
 };
 
+/* a checkpoint is a million small fields: the stream functions without their lock */
+#if defined _MSC_VER
+  #define CK_FWRITE _fwrite_nolock
+  #define CK_FREAD  _fread_nolock
+#else
+  #define CK_FWRITE fwrite
+  #define CK_FREAD  fread
+#endif
+
 SC_FUNC void ck_bytes(ckio *io,void *p,size_t n)
 {
   if (io->wr) {
-    if (n>0 && fwrite(p,1,n,io->f)!=n)
+    if (n>0 && CK_FWRITE(p,1,n,io->f)!=n)
       io->bad=TRUE;
-  } else if (io->bad || (n>0 && fread(p,1,n,io->f)!=n)) {
+  } else if (io->bad || (n>0 && CK_FREAD(p,1,n,io->f)!=n)) {
     io->bad=TRUE;
     memset(p,0,n);
   } /* if */
@@ -496,7 +517,7 @@ static void ck_state(ckio *io)
   CKV(io,v);
   if (v!=sNAMEMAX)
     io->bad=TRUE;
-  CKV(io,ck_ordinal);
+  /* the ordinal is not part of the state: a declaration added before a boundary changes it */
 
   #define CK_SCALAR(var) CKV(io,var);
   CK_SCALARS(CK_SCALAR)
@@ -742,6 +763,9 @@ static const char *ck_savedir=NULL;
 static double ck_every=0.150;
 static double ck_last=0;
 static long ck_stop=-1;
+static const char *ck_stop_at=NULL;     /* PAWNCC_SEG_STOP_AT */
+static unsigned long ck_at_pos,ck_at_before,ck_at_rest,ck_at_after;
+static const char *ck_at_name=NULL;
 static const char *ck_out=NULL;
 static int ck_dbgstart=0;
 static int ck_skip_next=0;      /* the loaded state was saved at this very boundary: do not count it again */       /* debug strings that were there when the segment started */
@@ -760,6 +784,89 @@ static double ck_cputime(void)
   return (double)clock()/CLOCKS_PER_SEC;
 }
 
+/* ----- the place of a boundary in the source ------------------------------------------------- *
+ * "<pos> <before> <rest> <after> <file>": <pos> is the read position in the file (the start of the
+ * line after the one in pline), <before> a hash of the CK_AROUND bytes in front of it, <rest> a hash
+ * of the rest of pline (a macro line may hold several declarations: they share <pos>) and of the
+ * include levels around the file (their names and the text behind their positions), <after> a hash
+ * of the CK_AROUND bytes behind <pos>. A segment stops at the boundary in that file with that <rest>
+ * whose <after> is the same (an edit in front of it moved it), or whose <pos> and <before> are (an
+ * edit right behind it). A wrong stop (equal text twice) shows in the chain check. */
+
+#define CK_AROUND   2048   /* the doc comments of omp-stdlib repeat for more than 1 KB */
+
+static unsigned long ck_fnv(unsigned long h,const unsigned char *p,size_t n)
+{
+  while (n-->0) {
+    h^=*p++;
+    h=(h*16777619UL) & 0xffffffffUL;
+  } /* while */
+  return h;
+}
+
+static int ck_where_parts(unsigned long *pos,unsigned long *before,unsigned long *rest,unsigned long *after,const char **name)
+{
+  const unsigned char *data;
+  size_t len,at,lo,hi;
+  if (inpf==NULL || (*name=pc_srcname(inpf))==NULL)
+    return FALSE;
+  data=pc_srcdata(inpf,&len);
+  at=pc_srcpos(inpf,NULL);
+  if (data==NULL || at>len)
+    return FALSE;
+  lo=(at>CK_AROUND) ? at-CK_AROUND : 0;
+  hi=(len-at>CK_AROUND) ? at+CK_AROUND : len;
+  *pos=(unsigned long)at;
+  *before=ck_fnv(2166136261UL,data+lo,at-lo);
+  *rest=2166136261UL;
+  if (lptr!=NULL)
+    *rest=ck_fnv(*rest,lptr,strlen((const char*)lptr));
+  {
+    /* the include levels around this file (a file included more than once - y_unique, say - has the
+     * same text each time): the name of every outer file and the text behind its read position */
+    int i,n=ckpt_level_count()-1,fnum,line;
+    FILE *h;
+    for (i=0; i<n; i++) {
+      const char *nm;
+      const unsigned char *d;
+      size_t dl,dp,dh;
+      ckpt_level_get(i,&fnum,&line,&h);
+      if (h==NULL || (nm=pc_srcname(h))==NULL || (d=pc_srcdata(h,&dl))==NULL)
+        continue;
+      dp=pc_srcpos(h,NULL);
+      if (dp>dl)
+        dp=dl;
+      dh=(dl-dp>CK_AROUND/4) ? dp+CK_AROUND/4 : dl;
+      *rest=ck_fnv(*rest,(const unsigned char*)nm,strlen(nm)+1);
+      *rest=ck_fnv(*rest,d+dp,dh-dp);
+    } /* for */
+  }
+  *after=ck_fnv(2166136261UL,data+at,hi-at);
+  return TRUE;
+}
+
+static void ck_where(char *buf)
+{
+  unsigned long pos,before,rest,after;
+  const char *name;
+  if (ck_where_parts(&pos,&before,&rest,&after,&name))
+    sprintf(buf,"%lu %08lx %08lx %08lx %.*s",pos,before,rest,after,_MAX_PATH,name);
+  else
+    strcpy(buf,"-");
+}
+
+static int ck_at_stop(void)
+{
+  unsigned long pos,before,rest,after;
+  const char *name;
+  if (ck_at_name==NULL || inpf==NULL || (name=pc_srcname(inpf))==NULL || strcmp(name,ck_at_name)!=0)
+    return FALSE;
+  if (!ck_where_parts(&pos,&before,&rest,&after,&name)
+      || rest!=ck_at_rest || strcmp(name,ck_at_name)!=0)
+    return FALSE;
+  return after==ck_at_after || (pos==ck_at_pos && before==ck_at_before);
+}
+
 SC_FUNC void ckpt_init(void)
 {
   const char *s;
@@ -772,10 +879,16 @@ SC_FUNC void ckpt_init(void)
     ck_every=atoi(s)/1000.0;
   if ((s=getenv("PAWNCC_SEG_STOP"))!=NULL && *s!='\0')
     ck_stop=atol(s);
+  if ((s=getenv("PAWNCC_SEG_STOP_AT"))!=NULL && *s!='\0') {
+    int used=0;
+    ck_stop_at=s;
+    if (sscanf(s,"%lu %lx %lx %lx %n",&ck_at_pos,&ck_at_before,&ck_at_rest,&ck_at_after,&used)>=4 && used>0)
+      ck_at_name=s+used;
+  } /* if */
   ck_out=getenv("PAWNCC_SEG_OUT");
   if (ck_out!=NULL && *ck_out=='\0')
     ck_out=NULL;
-  ck_mode=(ck_savedir!=NULL || ck_stop>=0 || ck_out!=NULL) ? 1 : 0;
+  ck_mode=(ck_savedir!=NULL || ck_stop>=0 || ck_stop_at!=NULL || ck_out!=NULL || getenv("PAWNCC_KEYS_DUMP")!=NULL) ? 1 : 0;
   ck_last=ck_cputime();
   if (ck_mode>0)
     pc_srcopen_hook=ck_srcopen;
@@ -819,9 +932,9 @@ static void ck_write_outputs(void)
   ck_timing("outputs",t0);
 }
 
-static void ck_write_done(int ok)
+static void ck_write_done(int ok,int atboundary)
 {
-  char name[_MAX_PATH+16];
+  char name[_MAX_PATH+16],key[_MAX_PATH+64];
   FILE *f;
   if (ck_out==NULL)
     return;
@@ -829,7 +942,11 @@ static void ck_write_done(int ok)
   ck_files_write(name);
   sprintf(name,"%s.done",ck_out);
   if ((f=fopen(name,"wb"))!=NULL) {
-    fprintf(f,"%d %d %d %ld\n",ok,errnum,warnnum,ck_ordinal);
+    if (atboundary)
+      ck_where(key);
+    else
+      strcpy(key,"end");
+    fprintf(f,"%d %d %d %ld\n%s\n",ok,errnum,warnnum,ck_ordinal,key);
     fclose(f);
   } /* if */
 }
@@ -850,6 +967,23 @@ SC_FUNC void ckpt_pass_begin(void)
   ck_last=ck_cputime();
   if (ck_mode>0)
     ck_files_reset();
+  if (sc_status==statWRITE) {
+    /* the start of the second pass: PAWNCC_CKPT_SAVE keeps it as "2-start.ck"; PAWNCC_PASS2_START
+     * (a first-pass segment that ends the pass) saves it there and ends the process. The caller
+     * relocates the second pass's checkpoints by the difference of two such starts. */
+    const char *s=getenv("PAWNCC_PASS2_START");
+    if (ck_savedir!=NULL) {
+      char name[_MAX_PATH+16];
+      sprintf(name,"%s/2-start.ck",ck_savedir);
+      ck_save(name);
+    } /* if */
+    if (s!=NULL && *s!='\0') {
+      int ok=ck_save(s);
+      fflush(stdout);
+      fflush(stderr);
+      exit(ok ? 0 : 3);
+    } /* if */
+  } /* if */
 }
 
 /* a normal compile that saves checkpoints: the files of the last stretch of the pass */
@@ -872,13 +1006,28 @@ SC_FUNC void ckpt_boundary(void)
   if (!ck_eligible())
     return;
   ck_ordinal++;
-  if (ck_stop>=0 && ck_ordinal==ck_stop) {
+  {
+    /* PAWNCC_KEYS_DUMP=<file>: the place key of every boundary (a check that keys do not repeat) */
+    static int dump=-1;
+    static FILE *df=NULL;
+    if (dump<0) {
+      const char *d=getenv("PAWNCC_KEYS_DUMP");
+      dump=(d!=NULL && *d!='\0' && (df=fopen(d,"ab"))!=NULL);
+    } /* if */
+    if (dump) {
+      char key[_MAX_PATH+64];
+      ck_where(key);
+      fprintf(df,"%d %ld %s\n",(sc_status==statFIRST) ? 1 : 2,ck_ordinal,key);
+      fflush(df);
+    } /* if */
+  }
+  if ((ck_stop_at!=NULL) ? ck_at_stop() : (ck_stop>=0 && ck_ordinal==ck_stop)) {
     char name[_MAX_PATH+16];
     int ok;
     sprintf(name,"%s.end.ck",(ck_out!=NULL) ? ck_out : "segment");
     ok=ck_save(name);
     ck_write_outputs();
-    ck_write_done(ok);
+    ck_write_done(ok,TRUE);
     fflush(stdout);
     fflush(stderr);
     exit(ok ? 0 : 3);
@@ -886,9 +1035,10 @@ SC_FUNC void ckpt_boundary(void)
   if (ck_savedir!=NULL) {
     double t=ck_cputime();
     if (t-ck_last>=ck_every) {
-      char name[_MAX_PATH+64];
+      char name[_MAX_PATH+64],key[_MAX_PATH+64];
       FILE *f;
       int pass=(sc_status==statFIRST) ? 1 : 2;
+      ck_where(key);
       sprintf(name,"%s/%d-%ld.pre.files",ck_savedir,pass,ck_ordinal);
       ck_files_write(name);
       ck_files_reset();
@@ -896,7 +1046,7 @@ SC_FUNC void ckpt_boundary(void)
       if (ck_save(name)) {
         sprintf(name,"%s/index.txt",ck_savedir);
         if ((f=fopen(name,"ab"))!=NULL) {
-          fprintf(f,"%d %ld %ld %.3f\n",pass,ck_ordinal,ckpt_read_bytes,t);
+          fprintf(f,"%d %ld %ld %.3f %s\n",pass,ck_ordinal,ckpt_read_bytes,t,key);
           fclose(f);
         } /* if */
       } /* if */
@@ -1127,7 +1277,10 @@ static int ck_linedelta(const ckinfo *a,const ckinfo *b,int fnum,int *dline,long
 }
 
 /* applies b - a to the state loaded now */
-static void ck_relocate(const ckinfo *a,const ckinfo *b)
+typedef struct s_ckmoved ckmoved;
+static void ck_put_new(const ckinfo *a,const ckinfo *b,ckmoved *moved,int nmoved);
+
+static void ck_relocate(const ckinfo *a,const ckinfo *b,ckmoved *moved,int nmoved)
 {
   cell dcode=b->code_idx-a->code_idx;
   cell ddata=(b->glb_declared-a->glb_declared)*(cell)sizeof(cell);
@@ -1278,6 +1431,18 @@ static void ck_relocate(const ckinfo *a,const ckinfo *b)
     } /* if */
     sym->work=i+1;
   } /* for */
+  for (sym=glbtab.next; sym!=NULL; sym=sym->next)
+    sym->work=0;
+  for (i=0; i<n; i++)
+    free(keys[i]);
+  free(keys);
+
+  /* the symbols segment j added or removed (their values are those of <b> already) */
+  if (nmoved>0 || a->nsym!=b->nsym)
+    ck_put_new(a,b,moved,nmoved);
+  keys=ck_keys(&n);
+  for (sym=glbtab.next, i=0; sym!=NULL; sym=sym->next, i++)
+    sym->work=i+1;
 
   /* referrers: drop those segment j dropped, add those it added */
   for (sym=glbtab.next, i=0; sym!=NULL; sym=sym->next, i++) {
@@ -1313,13 +1478,178 @@ static void ck_relocate(const ckinfo *a,const ckinfo *b)
   free(keys);
 }
 
+/* symbols that segment j added (in <b>, not in <a>): taken out of <b>'s table while it is loaded,
+ * with their links as keys, and put into the state loaded after it */
+struct s_ckmoved {
+  symbol *sym;
+  char *key,*parent,*child;
+  char **refs;
+  int nrefs;
+};
+
+typedef struct {
+  int n,cap;
+  char **keys;
+  symbol **syms;
+  int *ht;
+} ckindex;
+
+static void ck_index_make(ckindex *x)
+{
+  symbol *sym;
+  int i,slot;
+  x->keys=ck_keys(&x->n);
+  if ((x->syms=(symbol**)calloc((size_t)x->n+1,sizeof(symbol*)))==NULL)
+    error(103);
+  x->cap=1;
+  while (x->cap<2*x->n+2)
+    x->cap*=2;
+  if ((x->ht=(int*)malloc((size_t)x->cap*sizeof(int)))==NULL)
+    error(103);
+  for (i=0; i<x->cap; i++)
+    x->ht[i]=-1;
+  for (sym=glbtab.next, i=0; sym!=NULL; sym=sym->next, i++) {
+    x->syms[i]=sym;
+    sym->work=0;
+    for (slot=(int)(ck_strhash(x->keys[i])&(unsigned long)(x->cap-1)); x->ht[slot]>=0; slot=(slot+1)&(x->cap-1))
+      /* nothing */;
+    x->ht[slot]=i;
+  } /* for */
+}
+
+static symbol *ck_index_find(const ckindex *x,const char *key)
+{
+  int slot;
+  if (key==NULL)
+    return NULL;
+  for (slot=(int)(ck_strhash(key)&(unsigned long)(x->cap-1)); x->ht[slot]>=0; slot=(slot+1)&(x->cap-1))
+    if (strcmp(x->keys[x->ht[slot]],key)==0)
+      return x->syms[x->ht[slot]];
+  return NULL;
+}
+
+static void ck_index_free(ckindex *x)
+{
+  int i;
+  for (i=0; i<x->n; i++)
+    free(x->keys[i]);
+  free(x->keys);
+  free(x->syms);
+  free(x->ht);
+}
+
+static char *ck_keyof(const ckindex *x,const symbol *sym)
+{
+  int i;
+  if (sym==NULL)
+    return NULL;
+  for (i=0; i<x->n; i++)
+    if (x->syms[i]==sym)
+      return duplicatestring(x->keys[i]);
+  return NULL;
+}
+
+static int ck_take_new(const ckinfo *a,ckmoved **pmoved)
+{
+  ckindex x;
+  ckmoved *moved;
+  int i,k,count=0;
+  ck_index_make(&x);
+  if ((moved=(ckmoved*)calloc((size_t)x.n+1,sizeof(ckmoved)))==NULL)
+    error(103);
+  for (i=0; i<x.n; i++) {
+    symbol *sym=x.syms[i];
+    ckmoved *m;
+    if (ck_find(a,x.keys[i])>=0)
+      continue;
+    if (sym->ident==iFUNCTN && (sym->usage & uNATIVE)!=0)
+      continue;         /* its library is a pointer into the table of <b> (the chain check fails) */
+    if ((sym->flags & flagPREDEF)!=0)
+      continue;
+    m=&moved[count++];
+    m->sym=sym;
+    m->key=duplicatestring(x.keys[i]);
+    m->parent=ck_keyof(&x,sym->parent);
+    m->child=ck_keyof(&x,sym->child);
+    if ((m->refs=(char**)calloc((size_t)sym->numrefers+1,sizeof(char*)))==NULL)
+      error(103);
+    for (k=0; k<sym->numrefers; k++)
+      if (sym->refer[k]!=NULL)
+        m->refs[m->nrefs++]=ck_keyof(&x,sym->refer[k]);
+  } /* for */
+  for (i=0; i<count; i++)
+    ckpt_unlink_symbol(moved[i].sym);
+  ck_index_free(&x);
+  *pmoved=moved;
+  return count;
+}
+
+/* the state loaded now: the symbols segment j removed go, those it added come in */
+static void ck_put_new(const ckinfo *a,const ckinfo *b,ckmoved *moved,int nmoved)
+{
+  ckindex x;
+  symbol *sym,*gone;
+  int i,k,removed=0;
+
+  ck_index_make(&x);
+  for (i=0; i<a->nsym; i++) {
+    if (ck_find(b,a->syms[i].key)>=0 || (gone=ck_index_find(&x,a->syms[i].key))==NULL)
+      continue;
+    if ((gone->flags & flagPREDEF)!=0)
+      continue;
+    for (sym=glbtab.next; sym!=NULL; sym=sym->next) {
+      if (sym->parent==gone)
+        sym->parent=NULL;
+      if (sym->child==gone)
+        sym->child=NULL;
+      for (k=0; k<sym->numrefers; k++)
+        if (sym->refer[k]==gone)
+          sym->refer[k]=NULL;
+    } /* for */
+    if (curfunc==gone)
+      curfunc=NULL;
+    delete_symbol(&glbtab,gone);
+    removed++;
+  } /* for */
+  if (removed>0) {
+    ck_index_free(&x);
+    ck_index_make(&x);
+  } /* if */
+  for (i=0; i<nmoved; i++) {
+    if (ck_index_find(&x,moved[i].key)!=NULL) {
+      moved[i].sym=NULL;    /* this state has it already (made again later) */
+      continue;
+    } /* if */
+    moved[i].sym=ckpt_insert_symbol(moved[i].sym);
+  } /* for */
+  ck_index_free(&x);
+  ck_index_make(&x);
+  for (i=0; i<nmoved; i++) {
+    ckmoved *m=&moved[i];
+    if ((sym=m->sym)==NULL)
+      continue;
+    sym->parent=ck_index_find(&x,m->parent);
+    sym->child=ck_index_find(&x,m->child);
+    for (k=0; k<sym->numrefers; k++)
+      sym->refer[k]=NULL;
+    for (k=0; k<m->nrefs; k++) {
+      symbol *r=ck_index_find(&x,m->refs[k]);
+      if (r!=NULL)
+        refer_symbol(sym,r);
+    } /* for */
+  } /* for */
+  ck_index_free(&x);
+  if (getenv("PAWNCC_CKPT_DEBUG")!=NULL)
+    fprintf(stderr,"[ckpt] relocation: %d symbols added, %d removed\n",nmoved,removed);
+}
+
 static void ck_loadinfo(const char *path,ckinfo *ci)
 {
   if (!ck_load(path)) {
     pc_printf("[ckpt] cannot load %s\n",path);
     exit(4);
   } /* if */
-  ck_capture(ci);
+  { double tc=ck_wall(); ck_capture(ci); ck_timing("capture",tc); }
 }
 
 /* PAWNCC_SEG_LOAD: put the state of a checkpoint in place; parse() continues from there */
@@ -1329,19 +1659,24 @@ SC_FUNC int ckpt_load_start(void)
   const char *ra=getenv("PAWNCC_SEG_RELOC_A");
   const char *rb=getenv("PAWNCC_SEG_RELOC_B");
   ckinfo ia,ib;
+  ckmoved *moved=NULL;
+  int nmoved=0;
   int reloc=(ra!=NULL && *ra!='\0' && rb!=NULL && *rb!='\0');
   if (path==NULL || *path=='\0')
     return FALSE;
   if (reloc) {
-    ck_loadinfo(rb,&ib);
     ck_loadinfo(ra,&ia);
+    ck_loadinfo(rb,&ib);
+    { double tt=ck_wall(); nmoved=ck_take_new(&ia,&moved); ck_timing("take",tt); }     /* <b> is the state loaded now */
   } /* if */
   if (!ck_load(path)) {
     pc_printf("[ckpt] cannot load %s\n",path);
     exit(4);
   } /* if */
   if (reloc) {
-    ck_relocate(&ia,&ib);   /* the records are not freed: the process ends with the segment */
+    double tr=ck_wall();
+    ck_relocate(&ia,&ib,moved,nmoved);
+    ck_timing("relocate",tr);   /* the records are not freed: the process ends with the segment */
     if (ck_out!=NULL || getenv("PAWNCC_SEG_OUT")!=NULL) {
       /* the start this segment really used, for the chain check */
       char name[_MAX_PATH+16];
@@ -1370,9 +1705,11 @@ SC_FUNC void ckpt_pass_end(void)
   sprintf(name,"%s.end.ck",ck_out);
   ok=ck_save(name);
   ck_write_outputs();
-  ck_write_done(ok);
+  ck_write_done(ok,FALSE);
   fflush(stdout);
   fflush(stderr);
+  if (ok && sc_status!=statFIRST && getenv("PAWNCC_PASS2_START")!=NULL)
+    return;     /* a first-pass segment goes on to the start of the second pass (ckpt_pass_begin) */
   exit(ok ? 0 : 3);
 }
 

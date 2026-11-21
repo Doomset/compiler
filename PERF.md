@@ -249,6 +249,57 @@ AMX as round 12.
 Found on the way: a Cyrillic file name without its extension (`#include "mod/ёлка"`) is not found in any
 version; the gamemode always writes `.inc`.
 
+## Round 16: segments stop at a place in the source; declarations relocated
+
+Round 15 stopped a segment at a boundary ordinal, so a declaration added or removed in front of it moved
+every later stop, and a new symbol was missing from every later checkpoint: the chain could not close.
+
+* **Stop at a place** (`PAWNCC_SEG_STOP_AT`). A boundary's key is the file, the read position, hashes of
+  the 2 KB in front of and behind it, and a hash of the rest of `pline` together with the include levels
+  around the file (each outer file's name and the 512 bytes behind its position). A segment stops at the
+  boundary of that file with the same rest whose text behind is the same (an edit in front moved it), or
+  whose position and text in front are (an edit right behind it). Why each part: a macro line holds
+  several declarations (same position, other rest); omp-stdlib repeats doc comments for more than 1 KB;
+  y_unique and some modules are included many times (same text, other include stack). On the gamemode
+  every key of a pass is unique (`PAWNCC_KEYS_DUMP` writes them all; 30.6 thousand per pass). The
+  ordinal is no longer part of a checkpoint. A segment reports the key it stopped at, the driver keeps
+  the new keys.
+* **Symbols added or removed** (`ck_take_new`, `ck_put_new`). Relocation loads `<a>` first, then `<b>`;
+  the symbols `<b>` has and `<a>` has not are unlinked from `<b>`'s table, their parent, child and
+  referrers kept as keys; after the start is loaded they go into the global list where `addsym()` puts
+  them, links resolved by key. Symbols only `<a>` has are deleted (and dropped from every referrer list).
+  Natives are not moved (their library is a pointer into `<b>`'s tables): the chain check fails and the
+  build falls back.
+* **The second pass after a declaration** (`PAWNCC_PASS2_START`). The first pass's last segment goes on
+  to the start of the second pass and saves it; every second-pass segment then starts at once, relocated
+  by the difference of the old and the new start, instead of one process running the whole second pass.
+* Checkpoint streams use `_fwrite_nolock`/`_fread_nolock` (a checkpoint is a million small fields):
+  load 0.11 -> 0.075 s.
+
+The driver (`tools/pawn_segments.py`) no longer runs rounds: when a segment ends and its end is not the
+next start, every segment behind it starts again at once (the running ones are killed), relocated by
+the difference of the set's start there and that end.
+
+Gamemode, 12 segments a pass, Release build on a quiet machine (the PGO build within noise of it; other
+agents' fuzzers ran during the PGO runs):
+
+| Case | Round 15 | Round 16 |
+|---|---:|---:|
+| file saved unchanged | 1.9 s | 1.8 s |
+| edit inside a function body | ~3.7 s | ~3.6 s (pipelined waves 2.5 s + assembly 1.05 s) |
+| new declaration (`stock`), or removed | ~7.5 s (normal compile) | ~6.3 s (first pass 2.4 s, second pass from its new start 2.9 s, assembly 1.1 s) |
+| new function called from an existing body | ~7.5 s | ~6.1 s |
+
+A relocated segment costs ~0.5 s more than a plain one: two more loads with their captures (0.25 s),
+moving symbols and relocating (0.2 s), saving its start for the chain check (0.04 s).
+
+A new `#define` still falls back (the macro table is not relocated). `tools/test_pawn_segments.py` adds the
+steps `use` (a new function called from an existing body), `macro` and `revert2`; PASS on the Release
+build with 12 and with 45 segments a pass (`MODS_SEG_EVERY_MS=75`), and on the PGO build.
+
+PGO training: the same test with the instrumented build (it is 4x slower, so the checkpoints are 4x denser
+unless `MODS_SEG_EVERY_MS` is raised accordingly).
+
 ## Round 15: both passes in segments from checkpoints (scckpt.c)
 
 A checkpoint is the complete compiler state at a top-level declaration boundary, written in a

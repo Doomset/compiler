@@ -4263,6 +4263,31 @@ static void ck_srchandle(ckio *io,FILE **h)
 
 /* puts the global table back in the saved list order; htnext[i] is the 1-based number of the next symbol in
  * the symbol cache chain of made[i] (0: none) */
+/* a symbol taken out of the global list without freeing it (moved into another state) */
+SC_FUNC void ckpt_unlink_symbol(symbol *sym)
+{
+  symbol *root=&glbtab;
+  while (root->next!=NULL && root->next!=sym)
+    root=root->next;
+  if (root->next!=sym)
+    return;
+  root->next=sym->next;
+  sym->next=NULL;
+  if (sym->is_anchor)
+    anchor_remove(sym);
+  if (sym->vclass==sGLOBAL)
+    symbol_cache_remove(sym);
+  sym->htnext=NULL;
+}
+
+/* puts such a symbol into the global list where addsym() would; the shell is freed, the members move */
+SC_FUNC symbol *ckpt_insert_symbol(symbol *sym)
+{
+  symbol *n=add_symbol(&glbtab,sym,TRUE);
+  free(sym);
+  return n;
+}
+
 SC_FUNC void ckpt_glbtab_link(symbol **made,int count,const int *htnext)
 {
   symbol *prev=&glbtab,*last=NULL;
